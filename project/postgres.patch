@@ -1,0 +1,1018 @@
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 1f947505af..ece34694d7 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -1962,6 +1962,10 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
+       <entry>Waiting to manage an extension's space allocation in shared
+        memory.</entry>
+      </row>
++     <row>
++      <entry><literal>CardFeedback</literal></entry>
++      <entry>Waiting to read or update cardinality feedback statistics.</entry>
++     </row>
+      <row>
+       <entry><literal>AutoFile</literal></entry>
+       <entry>Waiting to update the <filename>postgresql.auto.conf</filename>
+diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
+index 6a60fb3337..07e2829d76 100644
+--- a/src/backend/executor/execMain.c
++++ b/src/backend/executor/execMain.c
+@@ -36,6 +36,10 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "nodes/nodeFuncs.h"
++#include "optimizer/card_feedback.h"
++#include "executor/hashjoin.h"
++#include "common/hashfn.h"
+ 
+ #include "access/heapam.h"
+ #include "access/htup_details.h"
+@@ -69,6 +73,156 @@
+ #include "utils/snapmgr.h"
+ 
+ 
++/* Default-off collection; reusable observations require explicit completion proof. */
++bool enable_card_feedback_collect = false;
++
++/* Restrict candidates to complete output of a small serial plan vocabulary. */
++static bool
++CardFeedbackUnsupported(PlanState *ps, void *context)
++{
++	if (ps == NULL)
++		return false;
++	if (ps->initPlan != NIL || ps->subPlan != NIL || ps->plan->parallel_aware)
++		return true;
++	switch (nodeTag(ps->plan))
++	{
++		case T_SeqScan:
++		case T_IndexScan:
++		case T_IndexOnlyScan:
++		case T_Hash:
++			break;
++		case T_NestLoop:
++		case T_HashJoin:
++			if (((Join *) ps->plan)->jointype != JOIN_INNER)
++				return true;
++			break;
++		default:
++			return true;
++	}
++	return planstate_tree_walker(ps, CardFeedbackUnsupported, context);
++}
++
++/* Exact statement context, deliberately narrower than cross-query equivalence. */
++static uint64
++CardFeedbackRootKey(QueryDesc *qd)
++{
++	StringInfoData key;
++	ListCell *lc;
++	int start = Max(qd->plannedstmt->stmt_location, 0);
++	int length = qd->plannedstmt->stmt_len;
++	int rti = 0;
++
++	if (length <= 0)
++		length = strlen(qd->sourceText + start);
++	initStringInfo(&key);
++	appendStringInfo(&key, "%u:%u:", MyDatabaseId, GetUserId());
++	appendBinaryStringInfo(&key, qd->sourceText + start, length);
++	foreach(lc, qd->plannedstmt->rtable)
++	{
++		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
++
++		appendStringInfo(&key, ":%d:%d:%u", ++rti, (int) rte->rtekind, rte->relid);
++	}
++	return hash_bytes_extended((unsigned char *) key.data, key.len, 0);
++}
++
++/* Descend only along inputs whose complete consumption has been established. */
++static void
++CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool record)
++{
++	Instrumentation *instr;
++
++	if (ps == NULL || !complete)
++		return;
++	instr = ps->instrument;
++	if (instr == NULL)
++		return;
++	InstrEndLoop(instr);
++	if (record && instr->nloops == 1 && ps->plan->feedback_identity != NULL &&
++		ps->plan->feedback_sig != 0)
++	{
++		CardFeedbackRecord(ps->plan->feedback_sig, ps->plan->raw_est_rows,
++						   instr->ntuples, ps->plan->feedback_identity);
++		ereport(NOTICE,
++				(errmsg("card_feedback stored scope=subset signature=%llu actual=%.0f",
++						(unsigned long long) ps->plan->feedback_sig, instr->ntuples)));
++	}
++	switch (nodeTag(ps->plan))
++	{
++		case T_NestLoop:
++			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
++			/* Inner-unique joins can stop after the first matching tuple. */
++			CollectCardFeedbackSubtree(innerPlanState(ps),
++									  !((NestLoopState *) ps)->js.single_match, true);
++			break;
++		case T_HashJoin:
++		{
++			HashJoinTable table = ((HashJoinState *) ps)->hj_HashTable;
++
++			/* An empty inner table can stop after prefetching one outer tuple. */
++			CollectCardFeedbackSubtree(outerPlanState(ps),
++									  table != NULL && table->totalTuples > 0 && table->nbatch == 1,
++									  true);
++			/* A built serial hash table fully consumes its original input. */
++			CollectCardFeedbackSubtree(innerPlanState(ps), table != NULL, true);
++			break;
++		}
++		case T_Hash:
++			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
++			break;
++		default:
++			break;
++	}
++}
++
++static bool
++ReportCardFeedbackRows(PlanState *ps, void *context)
++{
++	if (ps == NULL)
++		return false;
++	if (ps->instrument != NULL)
++	{
++		Instrumentation *instr = ps->instrument;
++		QueryDesc *qd = (QueryDesc *) context;
++
++		/* Idempotent after EXPLAIN has already finalized the loop. */
++		InstrEndLoop(instr);
++		if (ps == qd->planstate && instr->nloops == 1 &&
++			qd->estate->es_card_feedback_exhausted &&
++			!qd->estate->es_card_feedback_unsafe &&
++			!qd->plannedstmt->parallelModeNeeded &&
++			!qd->plannedstmt->hasModifyingCTE &&
++			!qd->plannedstmt->dependsOnRole &&
++			qd->plannedstmt->subplans == NIL && qd->params == NULL &&
++			qd->sourceText != NULL && !CardFeedbackUnsupported(ps, NULL))
++		{
++			if (ps->plan->feedback_sig != 0)
++				CardFeedbackRecord(ps->plan->feedback_sig,
++								   ps->plan->raw_est_rows, instr->ntuples,
++								   ps->plan->feedback_identity);
++			/* Root was stored above; collect proven complete reusable descendants. */
++			CollectCardFeedbackSubtree(ps, true, false);
++			ereport(NOTICE,
++					(errmsg("card_feedback candidate scope=query_root key=%llu estimated=%.0f actual=%.0f",
++							(unsigned long long) CardFeedbackRootKey(qd),
++							ps->plan->plan_rows, instr->ntuples)));
++		}
++		if (instr->nloops > 0 && ps->plan->feedback_sig != 0)
++			ereport(NOTICE,
++					(errmsg("card_feedback logical node=%d signature=%llu raw_estimated=%.0f validity=unverified",
++							ps->plan->plan_node_id,
++							(unsigned long long) ps->plan->feedback_sig,
++							ps->plan->raw_est_rows)));
++		if (instr->nloops > 0)
++			ereport(NOTICE,
++					(errmsg("card_feedback diagnostic node=%d tag=%d estimated=%.0f actual_per_loop=%.0f loops=%.0f total=%.0f validity=unverified",
++							ps->plan->plan_node_id, (int) nodeTag(ps->plan),
++							ps->plan->plan_rows, instr->ntuples / instr->nloops,
++							instr->nloops, instr->ntuples)));
++	}
++	return planstate_tree_walker(ps, ReportCardFeedbackRows, context);
++}
++
+ /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
+ ExecutorStart_hook_type ExecutorStart_hook = NULL;
+ ExecutorRun_hook_type ExecutorRun_hook = NULL;
+@@ -154,6 +308,11 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
+ 	Assert(queryDesc != NULL);
+ 	Assert(queryDesc->estate == NULL);
+ 
++	if (enable_card_feedback_collect && queryDesc->operation == CMD_SELECT &&
++		!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
++		queryDesc->instrument_options |= INSTRUMENT_ROWS;
++
++
+ 	/*
+ 	 * If the transaction is read-only, we need to check if any writes are
+ 	 * planned to non-temporary tables.  EXPLAIN is considered read-only.
+@@ -493,6 +652,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
+ 	 */
+ 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+ 
++	if (enable_card_feedback_collect && queryDesc->operation == CMD_SELECT &&
++		!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
++		ReportCardFeedbackRows(queryDesc->planstate, queryDesc);
++
+ 	ExecEndPlan(queryDesc->planstate, estate);
+ 
+ 	/* do away with our snapshots */
+@@ -548,6 +711,7 @@ ExecutorRewind(QueryDesc *queryDesc)
+ 	/*
+ 	 * rescan plan
+ 	 */
++	estate->es_card_feedback_unsafe = true;
+ 	ExecReScan(queryDesc->planstate);
+ 
+ 	MemoryContextSwitchTo(oldcontext);
+@@ -1687,6 +1851,11 @@ ExecutePlan(QueryDesc *queryDesc,
+ 	 * initialize local variables
+ 	 */
+ 	current_tuple_count = 0;
++	if (queryDesc->already_executed || numberTuples != 0 ||
++		!ScanDirectionIsForward(direction))
++		estate->es_card_feedback_unsafe = true;
++	estate->es_card_feedback_exhausted = false;
++
+ 
+ 	/*
+ 	 * Set the direction.
+@@ -1728,7 +1897,10 @@ ExecutePlan(QueryDesc *queryDesc,
+ 		 * process so we just end the loop...
+ 		 */
+ 		if (TupIsNull(slot))
++		{
++			estate->es_card_feedback_exhausted = ScanDirectionIsForward(direction);
+ 			break;
++		}
+ 
+ 		/*
+ 		 * If we have a junk filter, then project a new tuple with the junk
+diff --git a/src/backend/optimizer/path/Makefile b/src/backend/optimizer/path/Makefile
+index 1e199ff66f..0931a42e75 100644
+--- a/src/backend/optimizer/path/Makefile
++++ b/src/backend/optimizer/path/Makefile
+@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
+ 
+ OBJS = \
+ 	allpaths.o \
++	card_feedback.o \
+ 	clausesel.o \
+ 	costsize.o \
+ 	equivclass.o \
+diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
+new file mode 100644
+index 0000000000..ec412ae436
+--- /dev/null
++++ b/src/backend/optimizer/path/card_feedback.c
+@@ -0,0 +1,393 @@
++/* Diagnostic signatures and verified snapshot-scoped cardinality feedback. */
++#include "postgres.h"
++
++#include "common/hashfn.h"
++#include "access/xact.h"
++#include "catalog/pg_class.h"
++#include "catalog/pg_inherits.h"
++#include "catalog/pg_operator_d.h"
++#include "catalog/pg_type_d.h"
++#include "nodes/nodeFuncs.h"
++#include "optimizer/cost.h"
++#include "storage/proc.h"
++#include "utils/fmgroids.h"
++#include "utils/lsyscache.h"
++#include "lib/stringinfo.h"
++#include "miscadmin.h"
++#include "nodes/print.h"
++#include "optimizer/card_feedback.h"
++#include "parser/parsetree.h"
++#include "storage/lwlock.h"
++#include "storage/shmem.h"
++#include "utils/hsearch.h"
++#include "utils/timestamp.h"
++
++bool enable_card_feedback_apply = false;
++int card_feedback_cached_plan_depth = 0;
++
++/* Validate and normalize a COPY: only built-in int4 equality/boolean filters. */
++static bool
++CardFeedbackNormalizeExpr(Node *node, void *context)
++{
++	Bitmapset *allowed = (Bitmapset *) context;
++
++	if (node == NULL)
++		return false;
++	switch (nodeTag(node))
++	{
++		case T_Var:
++		{
++			Var *var = (Var *) node;
++
++			if (!bms_is_member(var->varno, allowed) || var->varlevelsup != 0 ||
++				var->varattno <= 0 || var->vartype != INT4OID)
++				return true;
++			var->location = -1;
++			return false;
++		}
++		case T_Const:
++		{
++			Const *value = (Const *) node;
++
++			if (value->consttype != INT4OID && value->consttype != BOOLOID)
++				return true;
++			value->location = -1;
++			return false;
++		}
++		case T_OpExpr:
++		{
++			OpExpr *op = (OpExpr *) node;
++
++			if (op->opno != Int4EqualOperator)
++				return true;
++			op->location = -1;
++			op->opfuncid = F_INT4EQ;
++			break;
++		}
++		case T_BoolExpr:
++			((BoolExpr *) node)->location = -1;
++			break;
++		case T_RangeTblRef:
++			return !bms_is_member(((RangeTblRef *) node)->rtindex, allowed);
++		case T_FromExpr:
++		{
++			FromExpr *from = (FromExpr *) node;
++			ListCell *lc;
++
++			foreach(lc, from->fromlist)
++				if (CardFeedbackNormalizeExpr(lfirst(lc), allowed))
++					return true;
++			return CardFeedbackNormalizeExpr(from->quals, allowed);
++		}
++		case T_JoinExpr:
++		{
++			JoinExpr *join = (JoinExpr *) node;
++
++			return join->jointype != JOIN_INNER ||
++				CardFeedbackNormalizeExpr(join->larg, allowed) ||
++				CardFeedbackNormalizeExpr(join->rarg, allowed) ||
++				CardFeedbackNormalizeExpr(join->quals, allowed);
++		}
++		case T_List:
++			break;
++		default:
++			return true;
++	}
++	return expression_tree_walker(node, CardFeedbackNormalizeExpr, context);
++}
++
++/* Freeze the whole supported query context before join search changes paths. */
++static char *
++CardFeedbackReadonlyContext(PlannerInfo *root)
++{
++	Query *query = root->parse;
++	StringInfoData key;
++	ListCell *lc;
++	Bitmapset *allowed = NULL;
++	int rti = 0;
++	Node *jointree;
++	char *serialized;
++
++	if (root->feedback_reuse_checked)
++		return root->feedback_reuse_context;
++	root->feedback_reuse_checked = true;
++	if (!XactReadOnly || XactIsoLevel != XACT_REPEATABLE_READ ||
++		!IsTransactionBlock() || TransactionIdIsValid(GetTopTransactionIdIfAny()) ||
++		card_feedback_cached_plan_depth != 0 || root->glob->boundParams != NULL ||
++		max_parallel_workers_per_gather != 0 || root->parent_root != NULL ||
++		query->commandType != CMD_SELECT ||
++		query->hasAggs || query->hasWindowFuncs || query->hasTargetSRFs ||
++		query->hasSubLinks || query->hasModifyingCTE || query->hasRowSecurity ||
++		query->cteList != NIL || query->groupClause != NIL ||
++		query->groupingSets != NIL || query->havingQual != NULL ||
++		query->windowClause != NIL || query->distinctClause != NIL ||
++		query->sortClause != NIL || query->limitCount != NULL ||
++		query->limitOffset != NULL || query->rowMarks != NIL ||
++		query->setOperations != NULL)
++		return NULL;
++	initStringInfo(&key);
++	appendStringInfo(&key, "readonly-v2:%u:%u:%d:%lld:%u:",
++					 MyDatabaseId, GetUserId(), MyProcPid,
++					 (long long) MyStartTimestamp, MyProc->lxid);
++	foreach(lc, query->rtable)
++	{
++		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
++
++		rti++;
++		if (rte->rtekind == RTE_JOIN && rte->jointype == JOIN_INNER)
++			continue;
++		if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_RELATION ||
++			rte->tablesample != NULL || rte->securityQuals != NIL ||
++			rte->relid < FirstNormalObjectId || has_subclass(rte->relid) ||
++			get_rel_persistence(rte->relid) != RELPERSISTENCE_PERMANENT)
++		{
++			pfree(key.data);
++			return NULL;
++		}
++		allowed = bms_add_member(allowed, rti);
++		appendStringInfo(&key, "table:%d:%u;", rti, rte->relid);
++	}
++	if (bms_num_members(allowed) < 1 || bms_num_members(allowed) > 3)
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	foreach(lc, query->targetList)
++	{
++		TargetEntry *target = lfirst_node(TargetEntry, lc);
++		Node *expr = (Node *) copyObject(target->expr);
++
++		if (target->resjunk || !IsA(expr, Var) ||
++			CardFeedbackNormalizeExpr(expr, allowed))
++		{
++			pfree(key.data);
++			return NULL;
++		}
++		serialized = nodeToString(expr);
++		appendStringInfo(&key, "target:%s;", serialized);
++		pfree(serialized);
++	}
++	jointree = (Node *) copyObject(query->jointree);
++	if (CardFeedbackNormalizeExpr(jointree, allowed))
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	serialized = nodeToString(jointree);
++	appendStringInfo(&key, "tree:%s;", serialized);
++	pfree(serialized);
++	if (key.len >= CARD_FEEDBACK_IDENTITY_BYTES)
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	root->feedback_reuse_relids = allowed;
++	root->feedback_reuse_context = key.data;
++	return key.data;
++}
++
++char *
++CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
++{
++	const char *context = CardFeedbackReadonlyContext(root);
++	StringInfoData key;
++	int member = -1;
++
++	if (context == NULL || bms_is_empty(rel->relids) ||
++		!bms_is_subset(rel->relids, root->feedback_reuse_relids) ||
++		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL))
++		return NULL;
++	initStringInfo(&key);
++	appendStringInfo(&key, "%ssubset:", context);
++	while ((member = bms_next_member(rel->relids, member)) >= 0)
++		appendStringInfo(&key, "%d,", member);
++	if (key.len >= CARD_FEEDBACK_IDENTITY_BYTES)
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	return key.data;
++}
++
++uint64
++card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel)
++{
++	StringInfoData key;
++	int member = -1;
++	uint64 result;
++
++	/* Subquery/outer-join identities need a separate design. */
++	if (root->parent_root != NULL || root->parse->commandType != CMD_SELECT ||
++		root->parse->hasSubLinks || root->parse->hasModifyingCTE ||
++		root->parse->hasRowSecurity || bms_is_empty(rel->relids))
++		return 0;
++	if (root->feedback_context == 0)
++	{
++		char *serialized = nodeToString(root->parse);
++
++		root->feedback_context = hash_bytes_extended((unsigned char *) serialized,
++												 strlen(serialized), 0);
++		pfree(serialized);
++	}
++	initStringInfo(&key);
++	appendStringInfo(&key, "%u:%u:%llu", MyDatabaseId, GetUserId(),
++					 (unsigned long long) root->feedback_context);
++	while ((member = bms_next_member(rel->relids, member)) >= 0)
++	{
++		RangeTblEntry *rte;
++
++		if (member <= 0 || member >= root->simple_rel_array_size)
++		{
++			pfree(key.data);
++			return 0;
++		}
++		rte = planner_rt_fetch(member, root);
++		if (rte->rtekind != RTE_RELATION)
++		{
++			pfree(key.data);
++			return 0;
++		}
++		appendStringInfo(&key, ":%d:%u", member, rte->relid);
++	}
++	result = hash_bytes_extended((unsigned char *) key.data, key.len, 0);
++	pfree(key.data);
++	return result;
++}
++
++/* Shared observations have server lifetime; reusable identities are transaction-scoped. */
++static HTAB *CardFeedbackHash = NULL;
++
++Size
++CardFeedbackShmemSize(void)
++{
++	return hash_estimate_size(CARD_FEEDBACK_MAX_ENTRIES, sizeof(CardFeedbackEntry));
++}
++
++void
++CardFeedbackShmemInit(void)
++{
++	HASHCTL ctl;
++
++	MemSet(&ctl, 0, sizeof(ctl));
++	ctl.keysize = sizeof(CardFeedbackKey);
++	ctl.entrysize = sizeof(CardFeedbackEntry);
++	CardFeedbackHash = ShmemInitHash("Cardinality feedback statistics",
++									CARD_FEEDBACK_MAX_ENTRIES,
++									CARD_FEEDBACK_MAX_ENTRIES,
++									&ctl, HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
++}
++
++void
++CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
++				   const char *identity)
++{
++	CardFeedbackKey key;
++	CardFeedbackEntry *entry;
++	bool found;
++
++	if (signature == 0 || CardFeedbackHash == NULL)
++		return;
++	MemSet(&key, 0, sizeof(key));
++	key.database_id = MyDatabaseId;
++	key.user_id = GetUserId();
++	key.signature = signature;
++	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
++	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
++	if (entry == NULL && hash_get_num_entries(CardFeedbackHash) < CARD_FEEDBACK_MAX_ENTRIES)
++	{
++		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
++		if (entry != NULL)
++		{
++			entry->identity[0] = '\0';
++			if (identity != NULL)
++				strlcpy(entry->identity, identity, sizeof(entry->identity));
++			entry->observations = 0;
++			entry->ema_actual_rows = actual_rows;
++		}
++	}
++	/* At capacity, skip new identities; existing entries can still be updated. */
++	/* A hash collision must never merge a reusable identity with another entry. */
++	if (entry != NULL &&
++		strcmp(entry->identity, identity != NULL ? identity : "") == 0)
++	{
++		entry->raw_est_rows = raw_rows;
++		entry->last_actual_rows = actual_rows;
++		if (entry->observations > 0)
++			entry->ema_actual_rows = 0.5 * actual_rows + 0.5 * entry->ema_actual_rows;
++		entry->observations++;
++		entry->last_updated = GetCurrentTimestamp();
++	}
++	LWLockRelease(CardFeedbackLock);
++}
++
++CardFeedbackEntry *
++CardFeedbackSnapshot(int *count)
++{
++	CardFeedbackEntry *copy = palloc(sizeof(CardFeedbackEntry) * CARD_FEEDBACK_MAX_ENTRIES);
++	HASH_SEQ_STATUS scan;
++	CardFeedbackEntry *entry;
++
++	*count = 0;
++	LWLockAcquire(CardFeedbackLock, LW_SHARED);
++	hash_seq_init(&scan, CardFeedbackHash);
++	while ((entry = hash_seq_search(&scan)) != NULL)
++	{
++		if (entry->key.database_id == MyDatabaseId && entry->key.user_id == GetUserId())
++			copy[(*count)++] = *entry;
++	}
++	LWLockRelease(CardFeedbackLock);
++	return copy;
++}
++
++int
++CardFeedbackReset(void)
++{
++	CardFeedbackEntry *entries;
++	int count;
++	int removed = 0;
++	int i;
++
++	/* One exclusive critical section makes reset atomic relative to writers. */
++	entries = palloc(sizeof(CardFeedbackEntry) * CARD_FEEDBACK_MAX_ENTRIES);
++	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
++	{
++		HASH_SEQ_STATUS scan;
++		CardFeedbackEntry *entry;
++
++		hash_seq_init(&scan, CardFeedbackHash);
++		while ((entry = hash_seq_search(&scan)) != NULL)
++			if (entry->key.database_id == MyDatabaseId && entry->key.user_id == GetUserId())
++				entries[removed++] = *entry;
++	}
++	count = removed;
++	for (i = 0; i < count; i++)
++		hash_search(CardFeedbackHash, &entries[i].key, HASH_REMOVE, NULL);
++	LWLockRelease(CardFeedbackLock);
++	pfree(entries);
++	return removed;
++}
++
++bool
++CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
++{
++	CardFeedbackKey key;
++	CardFeedbackEntry *entry;
++	bool found = false;
++
++	if (CardFeedbackHash == NULL || identity == NULL || signature == 0)
++		return false;
++	MemSet(&key, 0, sizeof(key));
++	key.database_id = MyDatabaseId;
++	key.user_id = GetUserId();
++	key.signature = signature;
++	LWLockAcquire(CardFeedbackLock, LW_SHARED);
++	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
++	if (entry != NULL && entry->observations > 0 &&
++		strcmp(entry->identity, identity) == 0)
++	{
++		*rows = entry->last_actual_rows;
++		found = true;
++	}
++	LWLockRelease(CardFeedbackLock);
++	return found;
++}
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 38b287437d..6b824da3ec 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -70,6 +70,8 @@
+  */
+ 
+ #include "postgres.h"
++#include "optimizer/card_feedback.h"
++#include "common/hashfn.h"
+ 
+ #include <limits.h>
+ #include <math.h>
+@@ -5026,6 +5028,26 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+ 							   NULL);
+ 
+ 	rel->rows = clamp_row_est(nrows);
++	rel->raw_est_rows = rel->rows;
++	rel->feedback_sig = card_feedback_rel_signature(root, rel);
++	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
++	if (rel->feedback_identity != NULL)
++	{
++		double learned_rows;
++
++		rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
++												   strlen(rel->feedback_identity), 0);
++		if (enable_card_feedback_apply &&
++			CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
++		{
++			rel->rows = clamp_row_est(learned_rows);
++			ereport(NOTICE,
++					(errmsg("card_feedback applied signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
++							(unsigned long long) rel->feedback_sig,
++							rel->raw_est_rows, learned_rows, rel->rows)));
++		}
++	}
++
+ 
+ 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
+ 
+@@ -5104,6 +5126,30 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+ 										   inner_rel->rows,
+ 										   sjinfo,
+ 										   restrictlist);
++	rel->raw_est_rows = rel->rows;
++	rel->feedback_sig = sjinfo->jointype == JOIN_INNER ?
++		card_feedback_rel_signature(root, rel) : 0;
++	if (sjinfo->jointype == JOIN_INNER)
++	{
++		rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
++		if (rel->feedback_identity != NULL)
++		{
++			double learned_rows;
++
++			rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
++													   strlen(rel->feedback_identity), 0);
++			if (enable_card_feedback_apply &&
++				CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
++			{
++				rel->rows = clamp_row_est(learned_rows);
++				ereport(NOTICE,
++						(errmsg("card_feedback applied join signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
++								(unsigned long long) rel->feedback_sig,
++								rel->raw_est_rows, learned_rows, rel->rows)));
++			}
++		}
++	}
++
+ }
+ 
+ /*
+diff --git a/src/backend/optimizer/path/meson.build b/src/backend/optimizer/path/meson.build
+index b8871fd2d2..5c48844e1a 100644
+--- a/src/backend/optimizer/path/meson.build
++++ b/src/backend/optimizer/path/meson.build
+@@ -2,6 +2,7 @@
+ 
+ backend_sources += files(
+   'allpaths.c',
++  'card_feedback.c',
+   'clausesel.c',
+   'costsize.c',
+   'equivclass.c',
+diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
+index 942392218c..d6ebfa3f14 100644
+--- a/src/backend/optimizer/plan/createplan.c
++++ b/src/backend/optimizer/plan/createplan.c
+@@ -5373,6 +5373,16 @@ copy_generic_path_info(Plan *dest, Path *src)
+ 	dest->plan_width = src->pathtarget->width;
+ 	dest->parallel_aware = src->parallel_aware;
+ 	dest->parallel_safe = src->parallel_safe;
++	/* Parameterized cardinalities are conditional and require separate keys. */
++	if (src->parent != NULL && src->param_info == NULL &&
++		(src->parent->reloptkind == RELOPT_BASEREL ||
++		 src->parent->reloptkind == RELOPT_JOINREL))
++	{
++		dest->feedback_sig = src->parent->feedback_sig;
++		dest->feedback_identity = src->parent->feedback_identity;
++		dest->raw_est_rows = src->parent->raw_est_rows;
++	}
++
+ }
+ 
+ /*
+diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
+index 8f1ded7338..28a585269b 100644
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -27,6 +27,7 @@
+ #include "commands/async.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
++#include "optimizer/card_feedback.h"
+ #include "postmaster/autovacuum.h"
+ #include "postmaster/bgworker_internals.h"
+ #include "postmaster/bgwriter.h"
+@@ -142,6 +143,7 @@ CalculateShmemSize(int *num_semaphores)
+ 	size = add_size(size, SyncScanShmemSize());
+ 	size = add_size(size, AsyncShmemSize());
+ 	size = add_size(size, StatsShmemSize());
++	size = add_size(size, CardFeedbackShmemSize());
+ #ifdef EXEC_BACKEND
+ 	size = add_size(size, ShmemBackendArraySize());
+ #endif
+@@ -232,6 +234,7 @@ CreateSharedMemoryAndSemaphores(void)
+ 	 * Set up shmem.c index hashtable
+ 	 */
+ 	InitShmemIndex();
++	CardFeedbackShmemInit();
+ 
+ 	dsm_shmem_init();
+ 
+diff --git a/src/backend/storage/lmgr/lwlocknames.txt b/src/backend/storage/lmgr/lwlocknames.txt
+index 6c7cf6c295..41ed55f62c 100644
+--- a/src/backend/storage/lmgr/lwlocknames.txt
++++ b/src/backend/storage/lmgr/lwlocknames.txt
+@@ -53,3 +53,4 @@ XactTruncationLock					44
+ # 45 was XactTruncationLock until removal of BackendRandomLock
+ WrapLimitsVacuumLock				46
+ NotifyQueueTailLock					47
++CardFeedbackLock                        48
+diff --git a/src/backend/utils/cache/plancache.c b/src/backend/utils/cache/plancache.c
+index eacf7e3340..fbf407bd66 100644
+--- a/src/backend/utils/cache/plancache.c
++++ b/src/backend/utils/cache/plancache.c
+@@ -62,6 +62,7 @@
+ #include "miscadmin.h"
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/optimizer.h"
++#include "optimizer/card_feedback.h"
+ #include "parser/analyze.h"
+ #include "parser/parsetree.h"
+ #include "storage/lmgr.h"
+@@ -936,8 +937,17 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
+ 	/*
+ 	 * Generate the plan.
+ 	 */
+-	plist = pg_plan_queries(qlist, plansource->query_string,
+-							plansource->cursor_options, boundParams);
++	card_feedback_cached_plan_depth++;
++	PG_TRY();
++	{
++		plist = pg_plan_queries(qlist, plansource->query_string,
++								plansource->cursor_options, boundParams);
++	}
++	PG_FINALLY();
++	{
++		card_feedback_cached_plan_depth--;
++	}
++	PG_END_TRY();
+ 
+ 	/* Release snapshot if we got one */
+ 	if (snapshot_set)
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 093567535b..93c3de4bee 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -19,6 +19,8 @@
+  *--------------------------------------------------------------------
+  */
+ #include "postgres.h"
++#include "executor/executor.h"
++#include "optimizer/card_feedback.h"
+ 
+ #include <float.h>
+ #include <limits.h>
+@@ -910,6 +912,25 @@ struct config_bool ConfigureNamesBool[] =
+ 		true,
+ 		NULL, NULL, NULL
+ 	},
++	{
++		{"enable_card_feedback_apply", PGC_USERSET, QUERY_TUNING_METHOD,
++			gettext_noop("Applies snapshot-scoped feedback to supported scans and inner joins."),
++			NULL,
++			GUC_EXPLAIN
++		},
++		&enable_card_feedback_apply,
++		false,
++		NULL, NULL, NULL
++	},
++	{
++		{"enable_card_feedback_collect", PGC_USERSET, QUERY_TUNING_METHOD,
++			gettext_noop("Reports diagnostic executor row counts for SELECT queries."),
++			NULL
++		},
++		&enable_card_feedback_collect,
++		false,
++		NULL, NULL, NULL
++	},
+ 	{
+ 		{"enable_nestloop", PGC_USERSET, QUERY_TUNING_METHOD,
+ 			gettext_noop("Enables the planner's use of nested-loop join plans."),
+diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
+index baef7e031e..ba2d4f7383 100644
+--- a/src/include/executor/executor.h
++++ b/src/include/executor/executor.h
+@@ -14,6 +14,8 @@
+ #ifndef EXECUTOR_H
+ #define EXECUTOR_H
+ 
++extern PGDLLIMPORT bool enable_card_feedback_collect;
++
+ #include "executor/execdesc.h"
+ #include "fmgr.h"
+ #include "nodes/lockoptions.h"
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 74718fa256..b935592efb 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -669,6 +669,8 @@ typedef struct EState
+ 
+ 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
+ 	int			es_instrument;	/* OR of InstrumentOption flags */
++	bool        es_card_feedback_exhausted; /* forward executor reached EOF */
++	bool        es_card_feedback_unsafe; /* bounded/repeated/rewound execution */
+ 	bool		es_finished;	/* true when ExecutorFinish is done */
+ 
+ 	List	   *es_exprcontexts;	/* List of ExprContexts within EState */
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 0162d59e07..c0480587b7 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -197,6 +197,10 @@ struct PlannerInfo
+ 
+ 	/* the Query being planned */
+ 	Query	   *parse;
++	uint64 feedback_context; /* cached exact query context */
++	bool feedback_reuse_checked;
++	char *feedback_reuse_context;
++	Relids feedback_reuse_relids;
+ 
+ 	/* global info for current planner run */
+ 	PlannerGlobal *glob;
+@@ -860,6 +864,9 @@ typedef struct RelOptInfo
+ 	 */
+ 	/* estimated number of result tuples */
+ 	Cardinality rows;
++	uint64 feedback_sig;
++	char *feedback_identity;
++	double raw_est_rows;
+ 
+ 	/*
+ 	 * per-relation planner control flags
+diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
+index d64fe6a328..9b19ea9cb7 100644
+--- a/src/include/nodes/plannodes.h
++++ b/src/include/nodes/plannodes.h
+@@ -126,6 +126,9 @@ typedef struct Plan
+ 	/*
+ 	 * estimated execution costs for plan (see costsize.c for more info)
+ 	 */
++	uint64      feedback_sig; /* exact query context plus logical relids */
++	double      raw_est_rows;
++	char       *feedback_identity;
+ 	Cost		startup_cost;	/* cost expended before fetching any tuples */
+ 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
+ 
+diff --git a/src/include/optimizer/card_feedback.h b/src/include/optimizer/card_feedback.h
+new file mode 100644
+index 0000000000..f8ddd1dae9
+--- /dev/null
++++ b/src/include/optimizer/card_feedback.h
+@@ -0,0 +1,42 @@
++#ifndef CARD_FEEDBACK_H
++#define CARD_FEEDBACK_H
++
++#include "nodes/pathnodes.h"
++#include "datatype/timestamp.h"
++
++extern uint64 card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel);
++
++#define CARD_FEEDBACK_MAX_ENTRIES 1024
++#define CARD_FEEDBACK_IDENTITY_BYTES 8192
++
++extern PGDLLIMPORT bool enable_card_feedback_apply;
++extern int card_feedback_cached_plan_depth;
++extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel);
++extern bool CardFeedbackLookup(uint64 signature, const char *identity, double *rows);
++
++typedef struct CardFeedbackKey
++{
++	Oid database_id;
++	Oid user_id;
++	uint64 signature;
++} CardFeedbackKey;
++
++typedef struct CardFeedbackEntry
++{
++	CardFeedbackKey key;
++	double raw_est_rows;
++	double last_actual_rows;
++	double ema_actual_rows;
++	uint64 observations;
++	TimestampTz last_updated;
++	char identity[CARD_FEEDBACK_IDENTITY_BYTES];
++} CardFeedbackEntry;
++
++extern Size CardFeedbackShmemSize(void);
++extern void CardFeedbackShmemInit(void);
++extern void CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
++							   const char *identity);
++extern CardFeedbackEntry *CardFeedbackSnapshot(int *count);
++extern int CardFeedbackReset(void);
++
++#endif
+diff --git a/src/test/regress/expected/guc.out b/src/test/regress/expected/guc.out
+index 127c953297..c350568fdd 100644
+--- a/src/test/regress/expected/guc.out
++++ b/src/test/regress/expected/guc.out
+@@ -858,10 +858,11 @@ SELECT name FROM tab_settings_flags
+ SELECT name FROM tab_settings_flags
+   WHERE category ~ '^Query Tuning' AND NOT explain
+   ORDER BY 1;
+-           name            
+----------------------------
++             name             
++------------------------------
+  default_statistics_target
+-(1 row)
++ enable_card_feedback_collect
++(2 rows)
+ 
+ -- Runtime-computed GUCs should be part of the preset category.
+ SELECT name FROM tab_settings_flags
+diff --git a/src/test/regress/expected/sysviews.out b/src/test/regress/expected/sysviews.out
+index 001c6e7eb9..c5ecb79e9a 100644
+--- a/src/test/regress/expected/sysviews.out
++++ b/src/test/regress/expected/sysviews.out
+@@ -113,6 +113,8 @@ select name, setting from pg_settings where name like 'enable%';
+ --------------------------------+---------
+  enable_async_append            | on
+  enable_bitmapscan              | on
++ enable_card_feedback_apply     | off
++ enable_card_feedback_collect   | off
+  enable_gathermerge             | on
+  enable_hashagg                 | on
+  enable_hashjoin                | on
+@@ -132,7 +134,7 @@ select name, setting from pg_settings where name like 'enable%';
+  enable_seqscan                 | on
+  enable_sort                    | on
+  enable_tidscan                 | on
+-(21 rows)
++(23 rows)
+ 
+ -- Test that the pg_timezone_names and pg_timezone_abbrevs views are
+ -- more-or-less working.  We can't test their contents in any great detail

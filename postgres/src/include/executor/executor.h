@@ -14,6 +14,8 @@
 #ifndef EXECUTOR_H
 #define EXECUTOR_H
 
+extern PGDLLIMPORT bool enable_card_feedback_collect;
+
 #include "executor/execdesc.h"
 #include "fmgr.h"
 #include "nodes/lockoptions.h"

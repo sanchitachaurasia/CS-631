@@ -19,6 +19,8 @@
  *--------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "executor/executor.h"
+#include "optimizer/card_feedback.h"
 
 #include <float.h>
 #include <limits.h>
@@ -908,6 +910,25 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&enable_memoize,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_card_feedback_apply", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Applies snapshot-scoped feedback to supported scans and inner joins."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_card_feedback_apply,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_card_feedback_collect", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Reports diagnostic executor row counts for SELECT queries."),
+			NULL
+		},
+		&enable_card_feedback_collect,
+		false,
 		NULL, NULL, NULL
 	},
 	{

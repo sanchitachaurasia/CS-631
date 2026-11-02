@@ -126,6 +126,9 @@ typedef struct Plan
 	/*
 	 * estimated execution costs for plan (see costsize.c for more info)
 	 */
+	uint64      feedback_sig; /* exact query context plus logical relids */
+	double      raw_est_rows;
+	char       *feedback_identity;
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 

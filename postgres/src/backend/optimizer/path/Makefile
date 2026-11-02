@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	allpaths.o \
+	card_feedback.o \
 	clausesel.o \
 	costsize.o \
 	equivclass.o \

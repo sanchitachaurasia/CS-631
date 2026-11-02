@@ -27,6 +27,7 @@
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "optimizer/card_feedback.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
@@ -142,6 +143,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
+	size = add_size(size, CardFeedbackShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -232,6 +234,7 @@ CreateSharedMemoryAndSemaphores(void)
 	 * Set up shmem.c index hashtable
 	 */
 	InitShmemIndex();
+	CardFeedbackShmemInit();
 
 	dsm_shmem_init();
 

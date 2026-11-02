@@ -36,6 +36,10 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/card_feedback.h"
+#include "executor/hashjoin.h"
+#include "common/hashfn.h"
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -68,6 +72,156 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 
+
+/* Default-off collection; reusable observations require explicit completion proof. */
+bool enable_card_feedback_collect = false;
+
+/* Restrict candidates to complete output of a small serial plan vocabulary. */
+static bool
+CardFeedbackUnsupported(PlanState *ps, void *context)
+{
+	if (ps == NULL)
+		return false;
+	if (ps->initPlan != NIL || ps->subPlan != NIL || ps->plan->parallel_aware)
+		return true;
+	switch (nodeTag(ps->plan))
+	{
+		case T_SeqScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_Hash:
+			break;
+		case T_NestLoop:
+		case T_HashJoin:
+			if (((Join *) ps->plan)->jointype != JOIN_INNER)
+				return true;
+			break;
+		default:
+			return true;
+	}
+	return planstate_tree_walker(ps, CardFeedbackUnsupported, context);
+}
+
+/* Exact statement context, deliberately narrower than cross-query equivalence. */
+static uint64
+CardFeedbackRootKey(QueryDesc *qd)
+{
+	StringInfoData key;
+	ListCell *lc;
+	int start = Max(qd->plannedstmt->stmt_location, 0);
+	int length = qd->plannedstmt->stmt_len;
+	int rti = 0;
+
+	if (length <= 0)
+		length = strlen(qd->sourceText + start);
+	initStringInfo(&key);
+	appendStringInfo(&key, "%u:%u:", MyDatabaseId, GetUserId());
+	appendBinaryStringInfo(&key, qd->sourceText + start, length);
+	foreach(lc, qd->plannedstmt->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+		appendStringInfo(&key, ":%d:%d:%u", ++rti, (int) rte->rtekind, rte->relid);
+	}
+	return hash_bytes_extended((unsigned char *) key.data, key.len, 0);
+}
+
+/* Descend only along inputs whose complete consumption has been established. */
+static void
+CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool record)
+{
+	Instrumentation *instr;
+
+	if (ps == NULL || !complete)
+		return;
+	instr = ps->instrument;
+	if (instr == NULL)
+		return;
+	InstrEndLoop(instr);
+	if (record && instr->nloops == 1 && ps->plan->feedback_identity != NULL &&
+		ps->plan->feedback_sig != 0)
+	{
+		CardFeedbackRecord(ps->plan->feedback_sig, ps->plan->raw_est_rows,
+						   instr->ntuples, ps->plan->feedback_identity);
+		ereport(NOTICE,
+				(errmsg("card_feedback stored scope=subset signature=%llu actual=%.0f",
+						(unsigned long long) ps->plan->feedback_sig, instr->ntuples)));
+	}
+	switch (nodeTag(ps->plan))
+	{
+		case T_NestLoop:
+			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
+			/* Inner-unique joins can stop after the first matching tuple. */
+			CollectCardFeedbackSubtree(innerPlanState(ps),
+									  !((NestLoopState *) ps)->js.single_match, true);
+			break;
+		case T_HashJoin:
+		{
+			HashJoinTable table = ((HashJoinState *) ps)->hj_HashTable;
+
+			/* An empty inner table can stop after prefetching one outer tuple. */
+			CollectCardFeedbackSubtree(outerPlanState(ps),
+									  table != NULL && table->totalTuples > 0 && table->nbatch == 1,
+									  true);
+			/* A built serial hash table fully consumes its original input. */
+			CollectCardFeedbackSubtree(innerPlanState(ps), table != NULL, true);
+			break;
+		}
+		case T_Hash:
+			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
+			break;
+		default:
+			break;
+	}
+}
+
+static bool
+ReportCardFeedbackRows(PlanState *ps, void *context)
+{
+	if (ps == NULL)
+		return false;
+	if (ps->instrument != NULL)
+	{
+		Instrumentation *instr = ps->instrument;
+		QueryDesc *qd = (QueryDesc *) context;
+
+		/* Idempotent after EXPLAIN has already finalized the loop. */
+		InstrEndLoop(instr);
+		if (ps == qd->planstate && instr->nloops == 1 &&
+			qd->estate->es_card_feedback_exhausted &&
+			!qd->estate->es_card_feedback_unsafe &&
+			!qd->plannedstmt->parallelModeNeeded &&
+			!qd->plannedstmt->hasModifyingCTE &&
+			!qd->plannedstmt->dependsOnRole &&
+			qd->plannedstmt->subplans == NIL && qd->params == NULL &&
+			qd->sourceText != NULL && !CardFeedbackUnsupported(ps, NULL))
+		{
+			if (ps->plan->feedback_sig != 0)
+				CardFeedbackRecord(ps->plan->feedback_sig,
+								   ps->plan->raw_est_rows, instr->ntuples,
+								   ps->plan->feedback_identity);
+			/* Root was stored above; collect proven complete reusable descendants. */
+			CollectCardFeedbackSubtree(ps, true, false);
+			ereport(NOTICE,
+					(errmsg("card_feedback candidate scope=query_root key=%llu estimated=%.0f actual=%.0f",
+							(unsigned long long) CardFeedbackRootKey(qd),
+							ps->plan->plan_rows, instr->ntuples)));
+		}
+		if (instr->nloops > 0 && ps->plan->feedback_sig != 0)
+			ereport(NOTICE,
+					(errmsg("card_feedback logical node=%d signature=%llu raw_estimated=%.0f validity=unverified",
+							ps->plan->plan_node_id,
+							(unsigned long long) ps->plan->feedback_sig,
+							ps->plan->raw_est_rows)));
+		if (instr->nloops > 0)
+			ereport(NOTICE,
+					(errmsg("card_feedback diagnostic node=%d tag=%d estimated=%.0f actual_per_loop=%.0f loops=%.0f total=%.0f validity=unverified",
+							ps->plan->plan_node_id, (int) nodeTag(ps->plan),
+							ps->plan->plan_rows, instr->ntuples / instr->nloops,
+							instr->nloops, instr->ntuples)));
+	}
+	return planstate_tree_walker(ps, ReportCardFeedbackRows, context);
+}
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
@@ -153,6 +307,11 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	/* sanity checks: queryDesc must not be started already */
 	Assert(queryDesc != NULL);
 	Assert(queryDesc->estate == NULL);
+
+	if (enable_card_feedback_collect && queryDesc->operation == CMD_SELECT &&
+		!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		queryDesc->instrument_options |= INSTRUMENT_ROWS;
+
 
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
@@ -493,6 +652,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	 */
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
+	if (enable_card_feedback_collect && queryDesc->operation == CMD_SELECT &&
+		!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		ReportCardFeedbackRows(queryDesc->planstate, queryDesc);
+
 	ExecEndPlan(queryDesc->planstate, estate);
 
 	/* do away with our snapshots */
@@ -548,6 +711,7 @@ ExecutorRewind(QueryDesc *queryDesc)
 	/*
 	 * rescan plan
 	 */
+	estate->es_card_feedback_unsafe = true;
 	ExecReScan(queryDesc->planstate);
 
 	MemoryContextSwitchTo(oldcontext);
@@ -1687,6 +1851,11 @@ ExecutePlan(QueryDesc *queryDesc,
 	 * initialize local variables
 	 */
 	current_tuple_count = 0;
+	if (queryDesc->already_executed || numberTuples != 0 ||
+		!ScanDirectionIsForward(direction))
+		estate->es_card_feedback_unsafe = true;
+	estate->es_card_feedback_exhausted = false;
+
 
 	/*
 	 * Set the direction.
@@ -1728,7 +1897,10 @@ ExecutePlan(QueryDesc *queryDesc,
 		 * process so we just end the loop...
 		 */
 		if (TupIsNull(slot))
+		{
+			estate->es_card_feedback_exhausted = ScanDirectionIsForward(direction);
 			break;
+		}
 
 		/*
 		 * If we have a junk filter, then project a new tuple with the junk

@@ -669,6 +669,8 @@ typedef struct EState
 
 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
 	int			es_instrument;	/* OR of InstrumentOption flags */
+	bool        es_card_feedback_exhausted; /* forward executor reached EOF */
+	bool        es_card_feedback_unsafe; /* bounded/repeated/rewound execution */
 	bool		es_finished;	/* true when ExecutorFinish is done */
 
 	List	   *es_exprcontexts;	/* List of ExprContexts within EState */

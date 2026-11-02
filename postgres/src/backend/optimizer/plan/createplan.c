@@ -5373,6 +5373,16 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;
+	/* Parameterized cardinalities are conditional and require separate keys. */
+	if (src->parent != NULL && src->param_info == NULL &&
+		(src->parent->reloptkind == RELOPT_BASEREL ||
+		 src->parent->reloptkind == RELOPT_JOINREL))
+	{
+		dest->feedback_sig = src->parent->feedback_sig;
+		dest->feedback_identity = src->parent->feedback_identity;
+		dest->raw_est_rows = src->parent->raw_est_rows;
+	}
+
 }
 
 /*

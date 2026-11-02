@@ -62,6 +62,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/card_feedback.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
@@ -936,8 +937,17 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	/*
 	 * Generate the plan.
 	 */
-	plist = pg_plan_queries(qlist, plansource->query_string,
-							plansource->cursor_options, boundParams);
+	card_feedback_cached_plan_depth++;
+	PG_TRY();
+	{
+		plist = pg_plan_queries(qlist, plansource->query_string,
+								plansource->cursor_options, boundParams);
+	}
+	PG_FINALLY();
+	{
+		card_feedback_cached_plan_depth--;
+	}
+	PG_END_TRY();
 
 	/* Release snapshot if we got one */
 	if (snapshot_set)

@@ -2,6 +2,7 @@
 
 backend_sources += files(
   'allpaths.c',
+  'card_feedback.c',
   'clausesel.c',
   'costsize.c',
   'equivclass.c',

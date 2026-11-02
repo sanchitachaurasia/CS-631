@@ -70,6 +70,8 @@
  */
 
 #include "postgres.h"
+#include "optimizer/card_feedback.h"
+#include "common/hashfn.h"
 
 #include <limits.h>
 #include <math.h>
@@ -5026,6 +5028,26 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 							   NULL);
 
 	rel->rows = clamp_row_est(nrows);
+	rel->raw_est_rows = rel->rows;
+	rel->feedback_sig = card_feedback_rel_signature(root, rel);
+	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
+	if (rel->feedback_identity != NULL)
+	{
+		double learned_rows;
+
+		rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
+												   strlen(rel->feedback_identity), 0);
+		if (enable_card_feedback_apply &&
+			CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
+		{
+			rel->rows = clamp_row_est(learned_rows);
+			ereport(NOTICE,
+					(errmsg("card_feedback applied signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
+							(unsigned long long) rel->feedback_sig,
+							rel->raw_est_rows, learned_rows, rel->rows)));
+		}
+	}
+
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
@@ -5104,6 +5126,30 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist);
+	rel->raw_est_rows = rel->rows;
+	rel->feedback_sig = sjinfo->jointype == JOIN_INNER ?
+		card_feedback_rel_signature(root, rel) : 0;
+	if (sjinfo->jointype == JOIN_INNER)
+	{
+		rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
+		if (rel->feedback_identity != NULL)
+		{
+			double learned_rows;
+
+			rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
+													   strlen(rel->feedback_identity), 0);
+			if (enable_card_feedback_apply &&
+				CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
+			{
+				rel->rows = clamp_row_est(learned_rows);
+				ereport(NOTICE,
+						(errmsg("card_feedback applied join signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
+								(unsigned long long) rel->feedback_sig,
+								rel->raw_est_rows, learned_rows, rel->rows)));
+			}
+		}
+	}
+
 }
 
 /*

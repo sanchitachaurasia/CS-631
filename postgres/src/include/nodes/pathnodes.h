@@ -197,6 +197,10 @@ struct PlannerInfo
 
 	/* the Query being planned */
 	Query	   *parse;
+	uint64 feedback_context; /* cached exact query context */
+	bool feedback_reuse_checked;
+	char *feedback_reuse_context;
+	Relids feedback_reuse_relids;
 
 	/* global info for current planner run */
 	PlannerGlobal *glob;
@@ -860,6 +864,9 @@ typedef struct RelOptInfo
 	 */
 	/* estimated number of result tuples */
 	Cardinality rows;
+	uint64 feedback_sig;
+	char *feedback_identity;
+	double raw_est_rows;
 
 	/*
 	 * per-relation planner control flags
