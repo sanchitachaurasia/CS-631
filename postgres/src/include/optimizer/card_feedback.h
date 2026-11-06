@@ -7,7 +7,8 @@
 extern uint64 card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel);
 
 #define CARD_FEEDBACK_MAX_ENTRIES 1024
-#define CARD_FEEDBACK_IDENTITY_BYTES 8192
+// leave room for a longer label when a query has more filters.
+#define CARD_FEEDBACK_IDENTITY_BYTES 16384
 
 extern PGDLLIMPORT bool enable_card_feedback_apply;
 extern int card_feedback_cached_plan_depth;

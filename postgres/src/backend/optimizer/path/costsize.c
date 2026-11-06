@@ -4999,6 +4999,37 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 }
 
 
+/* check for a saved count after estimating a scan or inner join. */
+static void
+CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
+{
+	double learned_rows;
+
+	// if collecting and reusing are both off, keep the usual estimate.
+	if (!enable_card_feedback_collect && !enable_card_feedback_apply)
+		return;
+	rel->raw_est_rows = rel->rows;
+	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
+	// if this count cannot be reused, give it a short label just for display
+	// when collecting is on.
+	if (rel->feedback_identity == NULL)
+	{
+		if (enable_card_feedback_collect)
+			rel->feedback_sig = card_feedback_rel_signature(root, rel);
+		return;
+	}
+
+	rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
+										   strlen(rel->feedback_identity), 0);
+	if (enable_card_feedback_apply &&
+		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
+	{
+		rel->rows = clamp_row_est(learned_rows);
+		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f",
+			 rel->feedback_sig, rel->raw_est_rows, learned_rows);
+	}
+}
+
 /*
  * set_baserel_size_estimates
  *		Set the size estimates for the given base relation.
@@ -5028,26 +5059,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 							   NULL);
 
 	rel->rows = clamp_row_est(nrows);
-	rel->raw_est_rows = rel->rows;
-	rel->feedback_sig = card_feedback_rel_signature(root, rel);
-	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
-	if (rel->feedback_identity != NULL)
-	{
-		double learned_rows;
-
-		rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
-												   strlen(rel->feedback_identity), 0);
-		if (enable_card_feedback_apply &&
-			CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
-		{
-			rel->rows = clamp_row_est(learned_rows);
-			ereport(NOTICE,
-					(errmsg("card_feedback applied signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
-							(unsigned long long) rel->feedback_sig,
-							rel->raw_est_rows, learned_rows, rel->rows)));
-		}
-	}
-
+	CardFeedbackEstimate(root, rel);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
@@ -5126,30 +5138,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   inner_rel->rows,
 										   sjinfo,
 										   restrictlist);
-	rel->raw_est_rows = rel->rows;
-	rel->feedback_sig = sjinfo->jointype == JOIN_INNER ?
-		card_feedback_rel_signature(root, rel) : 0;
 	if (sjinfo->jointype == JOIN_INNER)
-	{
-		rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
-		if (rel->feedback_identity != NULL)
-		{
-			double learned_rows;
-
-			rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
-													   strlen(rel->feedback_identity), 0);
-			if (enable_card_feedback_apply &&
-				CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
-			{
-				rel->rows = clamp_row_est(learned_rows);
-				ereport(NOTICE,
-						(errmsg("card_feedback applied join signature=%llu raw=%.0f learned=%.0f estimate=%.0f",
-								(unsigned long long) rel->feedback_sig,
-								rel->raw_est_rows, learned_rows, rel->rows)));
-			}
-		}
-	}
-
+		CardFeedbackEstimate(root, rel);
 }
 
 /*

@@ -1,0 +1,5 @@
+comment = 'Inspect and reset experimental cardinality feedback statistics'
+default_version = '1.0'
+# this tells postgresql where to find the extension code.
+module_pathname = '$libdir/card_feedback'
+relocatable = true

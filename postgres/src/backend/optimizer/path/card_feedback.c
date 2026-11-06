@@ -1,11 +1,13 @@
-/* Diagnostic signatures and verified snapshot-scoped cardinality feedback. */
+/* save complete row counts and use them when postgresql picks a plan. */
 #include "postgres.h"
 
 #include "common/hashfn.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_operator_d.h"
+#include "catalog/pg_proc_d.h"
 #include "catalog/pg_type_d.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
@@ -20,12 +22,32 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 bool enable_card_feedback_apply = false;
 int card_feedback_cached_plan_depth = 0;
 
-/* Validate and normalize a COPY: only built-in int4 equality/boolean filters. */
+// use built-in functions that postgresql marks as giving the same answer for
+// the same input.
+static bool
+safe_function(Oid function)
+{
+	return OidIsValid(function) && function < FirstGenbkiObjectId &&
+		func_volatile(function) == PROVOLATILE_IMMUTABLE;
+}
+
+// use ordinary values like an integer or some text. a whole row can contain
+// many different fields.
+static bool
+safe_type(Oid type)
+{
+	return OidIsValid(type) && type < FirstGenbkiObjectId &&
+		!type_is_rowtype(type);
+}
+
+/* ignore where the filter was written, so select and explain can match. */
 static bool
 CardFeedbackNormalizeExpr(Node *node, void *context)
 {
@@ -40,7 +62,7 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 			Var *var = (Var *) node;
 
 			if (!bms_is_member(var->varno, allowed) || var->varlevelsup != 0 ||
-				var->varattno <= 0 || var->vartype != INT4OID)
+				var->varattno <= 0 || !safe_type(var->vartype))
 				return true;
 			var->location = -1;
 			return false;
@@ -49,21 +71,58 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 		{
 			Const *value = (Const *) node;
 
-			if (value->consttype != INT4OID && value->consttype != BOOLOID)
+			if (!safe_type(value->consttype))
 				return true;
 			value->location = -1;
 			return false;
 		}
+		// look up the code for an operator such as = or < before keeping the
+		// comparison.
 		case T_OpExpr:
 		{
 			OpExpr *op = (OpExpr *) node;
 
-			if (op->opno != Int4EqualOperator)
+			op->opfuncid = get_opcode(op->opno);
+			if (!safe_function(op->opfuncid))
 				return true;
 			op->location = -1;
-			op->opfuncid = F_INT4EQ;
 			break;
 		}
+		// where id in ('2', '3') can turn into one check against a list.
+		// keep it so we can remember how many rows matched.
+		case T_ScalarArrayOpExpr:
+		{
+			ScalarArrayOpExpr *op = (ScalarArrayOpExpr *) node;
+
+			op->opfuncid = get_opcode(op->opno);
+			if (!safe_function(op->opfuncid))
+				return true;
+			op->location = -1;
+			break;
+		}
+		case T_FuncExpr:
+		{
+			FuncExpr *func = (FuncExpr *) node;
+
+			// a function that returns many rows can change the count. this
+			// check only accepts a function that gives one value.
+			if (func->funcretset || !safe_function(func->funcid))
+				return true;
+			func->location = -1;
+			break;
+		}
+		case T_RelabelType:
+			((RelabelType *) node)->location = -1;
+			break;
+		case T_ArrayExpr:
+			((ArrayExpr *) node)->location = -1;
+			break;
+		case T_NullTest:
+			((NullTest *) node)->location = -1;
+			break;
+		case T_BooleanTest:
+			((BooleanTest *) node)->location = -1;
+			break;
 		case T_BoolExpr:
 			((BoolExpr *) node)->location = -1;
 			break;
@@ -96,6 +155,35 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 	return expression_tree_walker(node, CardFeedbackNormalizeExpr, context);
 }
 
+// save which version of the data we counted, so an old count cannot match a
+// different view of the table.
+static void
+append_snapshot_scope(StringInfo key)
+{
+	// ask postgresql which rows this query is allowed to see.
+	Snapshot snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+
+	// if no older transaction is still running, this cutoff can identify the
+	// same view for another connection.
+	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_MVCC &&
+		snapshot->xmin == snapshot->xmax && !snapshot->takenDuringRecovery &&
+		TransactionIdIsNormal(snapshot->xmax))
+	{
+		FullTransactionId next = ReadNextFullTransactionId();
+		uint32 epoch = EpochFromFullTransactionId(next);
+
+		// transaction numbers can repeat. keep track of the round so an old
+		// number cannot match a new one.
+		if (snapshot->xmax > XidFromFullTransactionId(next))
+			epoch--;
+		appendStringInfo(key, "shared:%u:%u:", epoch, snapshot->xmax);
+	}
+	else
+		// otherwise only reuse the count in this connection and transaction.
+		appendStringInfo(key, "local:%d:%lld:%u:", MyProcPid,
+						 (long long) MyStartTimestamp, MyProc->lxid);
+}
+
 /* Freeze the whole supported query context before join search changes paths. */
 static char *
 CardFeedbackReadonlyContext(PlannerInfo *root)
@@ -115,23 +203,22 @@ CardFeedbackReadonlyContext(PlannerInfo *root)
 		!IsTransactionBlock() || TransactionIdIsValid(GetTopTransactionIdIfAny()) ||
 		card_feedback_cached_plan_depth != 0 || root->glob->boundParams != NULL ||
 		max_parallel_workers_per_gather != 0 || root->parent_root != NULL ||
+		// order by can still use an input count. limit 10 might stop after
+		// ten rows, so skip it.
 		query->commandType != CMD_SELECT ||
-		query->hasAggs || query->hasWindowFuncs || query->hasTargetSRFs ||
+		query->hasWindowFuncs || query->hasTargetSRFs ||
 		query->hasSubLinks || query->hasModifyingCTE || query->hasRowSecurity ||
-		query->cteList != NIL || query->groupClause != NIL ||
-		query->groupingSets != NIL || query->havingQual != NULL ||
-		query->windowClause != NIL || query->distinctClause != NIL ||
-		query->sortClause != NIL || query->limitCount != NULL ||
+		query->cteList != NIL || query->groupingSets != NIL ||
+		query->havingQual != NULL || query->limitCount != NULL ||
 		query->limitOffset != NULL || query->rowMarks != NIL ||
 		query->setOperations != NULL)
 		return NULL;
 	initStringInfo(&key);
-	appendStringInfo(&key, "readonly-v2:%u:%u:%d:%lld:%u:",
-					 MyDatabaseId, GetUserId(), MyProcPid,
-					 (long long) MyStartTimestamp, MyProc->lxid);
+	append_snapshot_scope(&key);
 	foreach(lc, query->rtable)
 	{
 		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		Relation relation;
 
 		rti++;
 		if (rte->rtekind == RTE_JOIN && rte->jointype == JOIN_INNER)
@@ -144,29 +231,27 @@ CardFeedbackReadonlyContext(PlannerInfo *root)
 			pfree(key.data);
 			return NULL;
 		}
+		relation = RelationIdGetRelation(rte->relid);
+		if (!RelationIsValid(relation) || relation->rd_rel->relam != HEAP_TABLE_AM_OID)
+		{
+			if (RelationIsValid(relation))
+				RelationClose(relation);
+			pfree(key.data);
+			return NULL;
+		}
 		allowed = bms_add_member(allowed, rti);
-		appendStringInfo(&key, "table:%d:%u;", rti, rte->relid);
+		// include where the table is stored. if postgresql rewrites the
+		// table, the old count should miss.
+		appendStringInfo(&key, "table:%d:%u:%u:%u;", rti, rte->relid,
+						 relation->rd_locator.spcOid, relation->rd_locator.relNumber);
+		RelationClose(relation);
 	}
-	if (bms_num_members(allowed) < 1 || bms_num_members(allowed) > 3)
+	if (bms_is_empty(allowed))
 	{
 		pfree(key.data);
 		return NULL;
 	}
-	foreach(lc, query->targetList)
-	{
-		TargetEntry *target = lfirst_node(TargetEntry, lc);
-		Node *expr = (Node *) copyObject(target->expr);
-
-		if (target->resjunk || !IsA(expr, Var) ||
-			CardFeedbackNormalizeExpr(expr, allowed))
-		{
-			pfree(key.data);
-			return NULL;
-		}
-		serialized = nodeToString(expr);
-		appendStringInfo(&key, "target:%s;", serialized);
-		pfree(serialized);
-	}
+	// selecting fewer columns or sorting rows still uses the same input count.
 	jointree = (Node *) copyObject(query->jointree);
 	if (CardFeedbackNormalizeExpr(jointree, allowed))
 	{
@@ -254,7 +339,7 @@ card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel)
 	return result;
 }
 
-/* Shared observations have server lifetime; reusable identities are transaction-scoped. */
+/* counts stay in memory until removed, cleared, or the server restarts. */
 static HTAB *CardFeedbackHash = NULL;
 
 Size
@@ -293,8 +378,22 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 	key.signature = signature;
 	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
 	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
-	if (entry == NULL && hash_get_num_entries(CardFeedbackHash) < CARD_FEEDBACK_MAX_ENTRIES)
+	if (entry == NULL)
 	{
+		if (hash_get_num_entries(CardFeedbackHash) == CARD_FEEDBACK_MAX_ENTRIES)
+		{
+			HASH_SEQ_STATUS scan;
+			CardFeedbackEntry *candidate;
+			CardFeedbackEntry *oldest = NULL;
+
+			// if the store is full, make room by removing the count we
+			// updated least recently.
+			hash_seq_init(&scan, CardFeedbackHash);
+			while ((candidate = hash_seq_search(&scan)) != NULL)
+				if (oldest == NULL || candidate->last_updated < oldest->last_updated)
+					oldest = candidate;
+			hash_search(CardFeedbackHash, &oldest->key, HASH_REMOVE, NULL);
+		}
 		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
 		if (entry != NULL)
 		{
@@ -305,7 +404,6 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 			entry->ema_actual_rows = actual_rows;
 		}
 	}
-	/* At capacity, skip new identities; existing entries can still be updated. */
 	/* A hash collision must never merge a reusable identity with another entry. */
 	if (entry != NULL &&
 		strcmp(entry->identity, identity != NULL ? identity : "") == 0)
@@ -342,13 +440,14 @@ CardFeedbackSnapshot(int *count)
 int
 CardFeedbackReset(void)
 {
-	CardFeedbackEntry *entries;
-	int count;
+	CardFeedbackKey *keys;
 	int removed = 0;
 	int i;
 
 	/* One exclusive critical section makes reset atomic relative to writers. */
-	entries = palloc(sizeof(CardFeedbackEntry) * CARD_FEEDBACK_MAX_ENTRIES);
+	// to delete an entry, we only need its key. there is no need to copy the
+	// whole count and filter text.
+	keys = palloc(sizeof(CardFeedbackKey) * CARD_FEEDBACK_MAX_ENTRIES);
 	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
 	{
 		HASH_SEQ_STATUS scan;
@@ -357,13 +456,12 @@ CardFeedbackReset(void)
 		hash_seq_init(&scan, CardFeedbackHash);
 		while ((entry = hash_seq_search(&scan)) != NULL)
 			if (entry->key.database_id == MyDatabaseId && entry->key.user_id == GetUserId())
-				entries[removed++] = *entry;
+				keys[removed++] = entry->key;
 	}
-	count = removed;
-	for (i = 0; i < count; i++)
-		hash_search(CardFeedbackHash, &entries[i].key, HASH_REMOVE, NULL);
+	for (i = 0; i < removed; i++)
+		hash_search(CardFeedbackHash, &keys[i], HASH_REMOVE, NULL);
 	LWLockRelease(CardFeedbackLock);
-	pfree(entries);
+	pfree(keys);
 	return removed;
 }
 

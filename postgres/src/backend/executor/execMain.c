@@ -89,10 +89,23 @@ CardFeedbackUnsupported(PlanState *ps, void *context)
 		case T_SeqScan:
 		case T_IndexScan:
 		case T_IndexOnlyScan:
+		// count rows from bitmap scans too, they are another way to read a
+		// table.
+		case T_BitmapHeapScan:
+		case T_BitmapIndexScan:
+		case T_BitmapAnd:
+		case T_BitmapOr:
 		case T_Hash:
+		case T_Material:
+		case T_Memoize:
+		case T_Sort:
+		case T_Agg:
 			break;
 		case T_NestLoop:
 		case T_HashJoin:
+		// we can count what the merge join returned. it can stop reading
+		// either side early, so we leave those counts alone.
+		case T_MergeJoin:
 			if (((Join *) ps->plan)->jointype != JOIN_INNER)
 				return true;
 			break;
@@ -111,6 +124,7 @@ CardFeedbackRootKey(QueryDesc *qd)
 	int start = Max(qd->plannedstmt->stmt_location, 0);
 	int length = qd->plannedstmt->stmt_len;
 	int rti = 0;
+	uint64 result;
 
 	if (length <= 0)
 		length = strlen(qd->sourceText + start);
@@ -123,12 +137,16 @@ CardFeedbackRootKey(QueryDesc *qd)
 
 		appendStringInfo(&key, ":%d:%d:%u", ++rti, (int) rte->rtekind, rte->relid);
 	}
-	return hash_bytes_extended((unsigned char *) key.data, key.len, 0);
+	result = hash_bytes_extended((unsigned char *) key.data, key.len, 0);
+
+	// we only print the short number, so free the text used to make it.
+	pfree(key.data);
+	return result;
 }
 
 /* Descend only along inputs whose complete consumption has been established. */
 static void
-CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool record)
+CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool root)
 {
 	Instrumentation *instr;
 
@@ -138,22 +156,28 @@ CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool record)
 	if (instr == NULL)
 		return;
 	InstrEndLoop(instr);
-	if (record && instr->nloops == 1 && ps->plan->feedback_identity != NULL &&
+	// only use a step that ran once. if it ran twice, the counter mixes the
+	// rows from both runs.
+	if (instr->nloops != 1)
+		return;
+	// the last step can save a count just for display, even if no later
+	// query can use it.
+	if ((root || ps->plan->feedback_identity != NULL) &&
 		ps->plan->feedback_sig != 0)
 	{
 		CardFeedbackRecord(ps->plan->feedback_sig, ps->plan->raw_est_rows,
 						   instr->ntuples, ps->plan->feedback_identity);
-		ereport(NOTICE,
+		ereport(DEBUG1,
 				(errmsg("card_feedback stored scope=subset signature=%llu actual=%.0f",
 						(unsigned long long) ps->plan->feedback_sig, instr->ntuples)));
 	}
 	switch (nodeTag(ps->plan))
 	{
 		case T_NestLoop:
-			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
+			CollectCardFeedbackSubtree(outerPlanState(ps), true, false);
 			/* Inner-unique joins can stop after the first matching tuple. */
 			CollectCardFeedbackSubtree(innerPlanState(ps),
-									  !((NestLoopState *) ps)->js.single_match, true);
+									  !((NestLoopState *) ps)->js.single_match, false);
 			break;
 		case T_HashJoin:
 		{
@@ -162,19 +186,26 @@ CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool record)
 			/* An empty inner table can stop after prefetching one outer tuple. */
 			CollectCardFeedbackSubtree(outerPlanState(ps),
 									  table != NULL && table->totalTuples > 0 && table->nbatch == 1,
-									  true);
+									  false);
 			/* A built serial hash table fully consumes its original input. */
-			CollectCardFeedbackSubtree(innerPlanState(ps), table != NULL, true);
+			CollectCardFeedbackSubtree(innerPlanState(ps), table != NULL, false);
 			break;
 		}
 		case T_Hash:
-			CollectCardFeedbackSubtree(outerPlanState(ps), true, true);
+		// for steps like sorting or counting rows, keep checking the input
+		// below them.
+		case T_Material:
+		case T_Sort:
+		case T_Agg:
+			CollectCardFeedbackSubtree(outerPlanState(ps), true, false);
 			break;
+		// steps like memoize can return saved rows, so do not count the input here.
 		default:
 			break;
 	}
 }
 
+// show the counts in the log. saving counts happens in a separate step.
 static bool
 ReportCardFeedbackRows(PlanState *ps, void *context)
 {
@@ -183,44 +214,50 @@ ReportCardFeedbackRows(PlanState *ps, void *context)
 	if (ps->instrument != NULL)
 	{
 		Instrumentation *instr = ps->instrument;
-		QueryDesc *qd = (QueryDesc *) context;
 
 		/* Idempotent after EXPLAIN has already finalized the loop. */
 		InstrEndLoop(instr);
-		if (ps == qd->planstate && instr->nloops == 1 &&
-			qd->estate->es_card_feedback_exhausted &&
-			!qd->estate->es_card_feedback_unsafe &&
-			!qd->plannedstmt->parallelModeNeeded &&
-			!qd->plannedstmt->hasModifyingCTE &&
-			!qd->plannedstmt->dependsOnRole &&
-			qd->plannedstmt->subplans == NIL && qd->params == NULL &&
-			qd->sourceText != NULL && !CardFeedbackUnsupported(ps, NULL))
-		{
-			if (ps->plan->feedback_sig != 0)
-				CardFeedbackRecord(ps->plan->feedback_sig,
-								   ps->plan->raw_est_rows, instr->ntuples,
-								   ps->plan->feedback_identity);
-			/* Root was stored above; collect proven complete reusable descendants. */
-			CollectCardFeedbackSubtree(ps, true, false);
-			ereport(NOTICE,
-					(errmsg("card_feedback candidate scope=query_root key=%llu estimated=%.0f actual=%.0f",
-							(unsigned long long) CardFeedbackRootKey(qd),
-							ps->plan->plan_rows, instr->ntuples)));
-		}
 		if (instr->nloops > 0 && ps->plan->feedback_sig != 0)
-			ereport(NOTICE,
+			ereport(DEBUG1,
 					(errmsg("card_feedback logical node=%d signature=%llu raw_estimated=%.0f validity=unverified",
 							ps->plan->plan_node_id,
 							(unsigned long long) ps->plan->feedback_sig,
 							ps->plan->raw_est_rows)));
 		if (instr->nloops > 0)
-			ereport(NOTICE,
+			ereport(DEBUG1,
 					(errmsg("card_feedback diagnostic node=%d tag=%d estimated=%.0f actual_per_loop=%.0f loops=%.0f total=%.0f validity=unverified",
 							ps->plan->plan_node_id, (int) nodeTag(ps->plan),
 							ps->plan->plan_rows, instr->ntuples / instr->nloops,
 							instr->nloops, instr->ntuples)));
 	}
 	return planstate_tree_walker(ps, ReportCardFeedbackRows, context);
+}
+
+// start at the final step, then check which input steps have complete
+// counts.
+static void
+CardFeedbackCollect(QueryDesc *qd)
+{
+	PlanState *root = qd->planstate;
+
+	if (qd->estate->es_card_feedback_exhausted &&
+		!qd->estate->es_card_feedback_unsafe &&
+		!qd->plannedstmt->parallelModeNeeded &&
+		!qd->plannedstmt->hasModifyingCTE &&
+		!qd->plannedstmt->dependsOnRole &&
+		qd->plannedstmt->subplans == NIL && qd->params == NULL &&
+		!CardFeedbackUnsupported(root, NULL))
+	{
+		CollectCardFeedbackSubtree(root, true, true);
+		if (message_level_is_interesting(DEBUG1) && qd->sourceText != NULL &&
+			root->instrument != NULL && root->instrument->nloops == 1)
+			elog(DEBUG1, "card_feedback candidate scope=query_root key=" UINT64_FORMAT
+				 " estimated=%.0f actual=%.0f", CardFeedbackRootKey(qd),
+				 root->plan->plan_rows, root->instrument->ntuples);
+	}
+
+	if (message_level_is_interesting(DEBUG1))
+		ReportCardFeedbackRows(root, NULL);
 }
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
@@ -654,7 +691,7 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 
 	if (enable_card_feedback_collect && queryDesc->operation == CMD_SELECT &&
 		!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
-		ReportCardFeedbackRows(queryDesc->planstate, queryDesc);
+		CardFeedbackCollect(queryDesc);
 
 	ExecEndPlan(queryDesc->planstate, estate);
 
