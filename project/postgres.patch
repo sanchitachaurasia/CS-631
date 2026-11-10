@@ -93,10 +93,10 @@ index 1e199ff66f..0931a42e75 100644
  	equivclass.o \
 diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
 new file mode 100644
-index 0000000000..d4a04fe7e1
+index 0000000000..4dc7792318
 --- /dev/null
 +++ b/src/backend/optimizer/path/card_feedback.c
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,763 @@
 +/* Learn complete row counts and use them before PostgreSQL costs new paths. */
 +#include "postgres.h"
 +
@@ -126,6 +126,33 @@ index 0000000000..d4a04fe7e1
 +#include "utils/relcache.h"
 +#include "utils/snapmgr.h"
 +#include "utils/timestamp.h"
++
++#ifdef CARD_FEEDBACK_PROFILE
++#include "portability/instr_time.h"
++#include "utils/guc.h"
++
++/* Built only for diagnostics. Report outside the shared critical section. */
++static void
++profile_store(const char *op, instr_time start, instr_time acquired,
++			  instr_time finished, bool hit)
++{
++	instr_time elapsed = finished;
++	instr_time acquire = acquired;
++	static bool reported_size = false;
++
++	INSTR_TIME_SUBTRACT(elapsed, start);
++	INSTR_TIME_SUBTRACT(acquire, start);
++	if (!reported_size)
++	{
++		elog(DEBUG2, "card_feedback profile bytes=%zu entry=%zu",
++			 CardFeedbackShmemSize(), sizeof(CardFeedbackEntry));
++		reported_size = true;
++	}
++	elog(DEBUG2, "card_feedback profile op=%s ns=" UINT64_FORMAT
++		 " acquire_ns=" UINT64_FORMAT " hit=%d", op,
++		 INSTR_TIME_GET_NANOSEC(elapsed), INSTR_TIME_GET_NANOSEC(acquire), hit);
++}
++#endif
 +
 +bool enable_card_feedback_collect = false;
 +bool enable_card_feedback_apply = false;
@@ -258,6 +285,13 @@ index 0000000000..d4a04fe7e1
 +append_snapshot_scope(StringInfo key)
 +{
 +	Snapshot snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
++#ifdef CARD_FEEDBACK_PROFILE
++	const char *local_scope = GetConfigOption("card_feedback.local_scope", true, false);
++
++	/* Compare scopes without changing either collection or the visible data. */
++	if (local_scope != NULL && strcmp(local_scope, "on") == 0)
++		snapshot = NULL;
++#endif
 +
 +	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_MVCC &&
 +		snapshot->xmin == snapshot->xmax && !snapshot->takenDuringRecovery &&
@@ -485,6 +519,12 @@ index 0000000000..d4a04fe7e1
 +	CardFeedbackKey key;
 +	CardFeedbackEntry *entry;
 +	bool found;
++#ifdef CARD_FEEDBACK_PROFILE
++	bool profile = message_level_is_interesting(DEBUG2);
++	instr_time start, acquired, finished, evict_start, evict_end;
++	const char *op = "update";
++	bool evicted = false;
++#endif
 +
 +	if (signature == 0 || CardFeedbackHash == NULL)
 +		return;
@@ -492,21 +532,42 @@ index 0000000000..d4a04fe7e1
 +	key.database_id = MyDatabaseId;
 +	key.user_id = GetUserId();
 +	key.signature = signature;
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++		INSTR_TIME_SET_CURRENT(start);
++#endif
 +	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++		INSTR_TIME_SET_CURRENT(acquired);
++#endif
 +	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
 +	if (entry == NULL)
 +	{
++#ifdef CARD_FEEDBACK_PROFILE
++		op = "insert";
++#endif
 +		if (hash_get_num_entries(CardFeedbackHash) == CARD_FEEDBACK_MAX_ENTRIES)
 +		{
 +			HASH_SEQ_STATUS scan;
 +			CardFeedbackEntry *candidate;
 +			CardFeedbackEntry *oldest = NULL;
 +
++#ifdef CARD_FEEDBACK_PROFILE
++			op = "replace";
++			evicted = true;
++			if (profile)
++				INSTR_TIME_SET_CURRENT(evict_start);
++#endif
 +			hash_seq_init(&scan, CardFeedbackHash);
 +			while ((candidate = hash_seq_search(&scan)) != NULL)
 +				if (oldest == NULL || candidate->last_updated < oldest->last_updated)
 +					oldest = candidate;
 +			hash_search(CardFeedbackHash, &oldest->key, HASH_REMOVE, NULL);
++#ifdef CARD_FEEDBACK_PROFILE
++			if (profile)
++				INSTR_TIME_SET_CURRENT(evict_end);
++#endif
 +		}
 +		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
 +		if (entry != NULL)
@@ -530,6 +591,15 @@ index 0000000000..d4a04fe7e1
 +		entry->last_updated = GetCurrentTimestamp();
 +	}
 +	LWLockRelease(CardFeedbackLock);
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++	{
++		INSTR_TIME_SET_CURRENT(finished);
++		profile_store(op, start, acquired, finished, entry != NULL);
++		if (evicted)
++			profile_store("evict", evict_start, evict_start, evict_end, true);
++	}
++#endif
 +}
 +
 +CardFeedbackEntry *
@@ -583,6 +653,10 @@ index 0000000000..d4a04fe7e1
 +	CardFeedbackKey key;
 +	CardFeedbackEntry *entry;
 +	bool found = false;
++#ifdef CARD_FEEDBACK_PROFILE
++	bool profile = message_level_is_interesting(DEBUG2);
++	instr_time start, acquired, finished;
++#endif
 +
 +	if (CardFeedbackHash == NULL || identity == NULL || signature == 0)
 +		return false;
@@ -590,7 +664,15 @@ index 0000000000..d4a04fe7e1
 +	key.database_id = MyDatabaseId;
 +	key.user_id = GetUserId();
 +	key.signature = signature;
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++		INSTR_TIME_SET_CURRENT(start);
++#endif
 +	LWLockAcquire(CardFeedbackLock, LW_SHARED);
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++		INSTR_TIME_SET_CURRENT(acquired);
++#endif
 +	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
 +	if (entry != NULL && entry->observations > 0 &&
 +		strcmp(entry->identity, identity) == 0)
@@ -599,6 +681,13 @@ index 0000000000..d4a04fe7e1
 +		found = true;
 +	}
 +	LWLockRelease(CardFeedbackLock);
++#ifdef CARD_FEEDBACK_PROFILE
++	if (profile)
++	{
++		INSTR_TIME_SET_CURRENT(finished);
++		profile_store("lookup", start, acquired, finished, found);
++	}
++#endif
 +	return found;
 +}
 +
