@@ -26,6 +26,36 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
+#ifdef CARD_FEEDBACK_PROFILE
+#include "portability/instr_time.h"
+#include "utils/guc.h"
+
+// show how long it took to get or save a count, including how long we waited
+// for the lock.
+static void
+profile_store(const char *op, instr_time start, instr_time acquired,
+			  instr_time finished, bool hit)
+{
+	instr_time elapsed = finished;
+	instr_time acquire = acquired;
+	static bool reported_size = false;
+
+	// subtract the two times to see how long the work and the wait took.
+	INSTR_TIME_SUBTRACT(elapsed, start);
+	INSTR_TIME_SUBTRACT(acquire, start);
+	// show how much space the store and each entry use, once per connection.
+	if (!reported_size)
+	{
+		elog(DEBUG2, "card_feedback profile bytes=%zu entry=%zu",
+			 CardFeedbackShmemSize(), sizeof(CardFeedbackEntry));
+		reported_size = true;
+	}
+	elog(DEBUG2, "card_feedback profile op=%s ns=" UINT64_FORMAT
+		 " acquire_ns=" UINT64_FORMAT " hit=%d", op,
+		 INSTR_TIME_GET_NANOSEC(elapsed), INSTR_TIME_GET_NANOSEC(acquire), hit);
+}
+#endif
+
 bool enable_card_feedback_apply = false;
 int card_feedback_cached_plan_depth = 0;
 
@@ -162,6 +192,14 @@ append_snapshot_scope(StringInfo key)
 {
 	// ask postgresql which rows this query is allowed to see.
 	Snapshot snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
+#ifdef CARD_FEEDBACK_PROFILE
+	const char *local_scope = GetConfigOption("card_feedback.local_scope", true, false);
+
+	// for this test, keep counts in one transaction so we can compare with
+	// sharing turned on.
+	if (local_scope != NULL && strcmp(local_scope, "on") == 0)
+		snapshot = NULL;
+#endif
 
 	// if no older transaction is still running, this cutoff can identify the
 	// same view for another connection.
@@ -369,6 +407,12 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 	CardFeedbackKey key;
 	CardFeedbackEntry *entry;
 	bool found;
+#ifdef CARD_FEEDBACK_PROFILE
+	bool profile = message_level_is_interesting(DEBUG2);
+	instr_time start, acquired, finished, evict_start, evict_end;
+	const char *op = "update";
+	bool evicted = false;
+#endif
 
 	if (signature == 0 || CardFeedbackHash == NULL)
 		return;
@@ -376,16 +420,39 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 	key.database_id = MyDatabaseId;
 	key.user_id = GetUserId();
 	key.signature = signature;
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+		// start the clock before asking for the lock, so the wait gets
+		// counted too.
+		INSTR_TIME_SET_CURRENT(start);
+#endif
 	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+		// the lock is ours now. save the time so we know how long we waited.
+		INSTR_TIME_SET_CURRENT(acquired);
+#endif
 	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
 	if (entry == NULL)
 	{
+#ifdef CARD_FEEDBACK_PROFILE
+		op = "insert";
+#endif
 		if (hash_get_num_entries(CardFeedbackHash) == CARD_FEEDBACK_MAX_ENTRIES)
 		{
 			HASH_SEQ_STATUS scan;
 			CardFeedbackEntry *candidate;
 			CardFeedbackEntry *oldest = NULL;
 
+#ifdef CARD_FEEDBACK_PROFILE
+			// a full store must remove an old count first. measure that work
+			// on its own.
+			op = "replace";
+			evicted = true;
+			if (profile)
+				// start timing the search for a count to remove.
+				INSTR_TIME_SET_CURRENT(evict_start);
+#endif
 			// if the store is full, make room by removing the count we
 			// updated least recently.
 			hash_seq_init(&scan, CardFeedbackHash);
@@ -393,6 +460,10 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 				if (oldest == NULL || candidate->last_updated < oldest->last_updated)
 					oldest = candidate;
 			hash_search(CardFeedbackHash, &oldest->key, HASH_REMOVE, NULL);
+#ifdef CARD_FEEDBACK_PROFILE
+			if (profile)
+				INSTR_TIME_SET_CURRENT(evict_end);
+#endif
 		}
 		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
 		if (entry != NULL)
@@ -416,6 +487,16 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 		entry->last_updated = GetCurrentTimestamp();
 	}
 	LWLockRelease(CardFeedbackLock);
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+	{
+		// let other connections use the store before we write to the log.
+		INSTR_TIME_SET_CURRENT(finished);
+		profile_store(op, start, acquired, finished, entry != NULL);
+		if (evicted)
+			profile_store("evict", evict_start, evict_start, evict_end, true);
+	}
+#endif
 }
 
 CardFeedbackEntry *
@@ -471,6 +552,10 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
 	CardFeedbackKey key;
 	CardFeedbackEntry *entry;
 	bool found = false;
+#ifdef CARD_FEEDBACK_PROFILE
+	bool profile = message_level_is_interesting(DEBUG2);
+	instr_time start, acquired, finished;
+#endif
 
 	if (CardFeedbackHash == NULL || identity == NULL || signature == 0)
 		return false;
@@ -478,7 +563,18 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
 	key.database_id = MyDatabaseId;
 	key.user_id = GetUserId();
 	key.signature = signature;
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+		// start the clock before asking for the lock, so the wait gets
+		// counted too.
+		INSTR_TIME_SET_CURRENT(start);
+#endif
 	LWLockAcquire(CardFeedbackLock, LW_SHARED);
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+		// the lock is ours now. save the time so we know how long we waited.
+		INSTR_TIME_SET_CURRENT(acquired);
+#endif
 	entry = hash_search(CardFeedbackHash, &key, HASH_FIND, NULL);
 	if (entry != NULL && entry->observations > 0 &&
 		strcmp(entry->identity, identity) == 0)
@@ -487,5 +583,13 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
 		found = true;
 	}
 	LWLockRelease(CardFeedbackLock);
+#ifdef CARD_FEEDBACK_PROFILE
+	if (profile)
+	{
+		// let other connections use the store before we write to the log.
+		INSTR_TIME_SET_CURRENT(finished);
+		profile_store("lookup", start, acquired, finished, found);
+	}
+#endif
 	return found;
 }
