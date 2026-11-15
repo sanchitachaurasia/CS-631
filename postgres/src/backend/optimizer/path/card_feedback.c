@@ -77,11 +77,17 @@ safe_type(Oid type)
 		!type_is_rowtype(type);
 }
 
+typedef struct FeedbackExprContext
+{
+	const Bitmapset *relids;
+	bool single_table;
+} FeedbackExprContext;
+
 /* ignore where the filter was written, so select and explain can match. */
 static bool
 CardFeedbackNormalizeExpr(Node *node, void *context)
 {
-	Bitmapset *allowed = (Bitmapset *) context;
+	FeedbackExprContext *expr = context;
 
 	if (node == NULL)
 		return false;
@@ -91,9 +97,20 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 		{
 			Var *var = (Var *) node;
 
-			if (!bms_is_member(var->varno, allowed) || var->varlevelsup != 0 ||
+			if (!bms_is_member(var->varno, expr->relids) || var->varlevelsup != 0 ||
 				var->varattno <= 0 || !safe_type(var->vartype))
 				return true;
+			// call it table one in this label, even if it came second in the
+			// query.
+			if (expr->single_table)
+			{
+				// a left join can give us a null instead of the original
+				// column value. skip making a key for sharing that count.
+				if (!bms_is_empty(var->varnullingrels))
+					return true;
+				var->varno = var->varnosyn = 1;
+				var->varattnosyn = var->varattno;
+			}
 			var->location = -1;
 			return false;
 		}
@@ -157,25 +174,25 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 			((BoolExpr *) node)->location = -1;
 			break;
 		case T_RangeTblRef:
-			return !bms_is_member(((RangeTblRef *) node)->rtindex, allowed);
+			return !bms_is_member(((RangeTblRef *) node)->rtindex, expr->relids);
 		case T_FromExpr:
 		{
 			FromExpr *from = (FromExpr *) node;
 			ListCell *lc;
 
 			foreach(lc, from->fromlist)
-				if (CardFeedbackNormalizeExpr(lfirst(lc), allowed))
+				if (CardFeedbackNormalizeExpr(lfirst(lc), context))
 					return true;
-			return CardFeedbackNormalizeExpr(from->quals, allowed);
+			return CardFeedbackNormalizeExpr(from->quals, context);
 		}
 		case T_JoinExpr:
 		{
 			JoinExpr *join = (JoinExpr *) node;
 
 			return join->jointype != JOIN_INNER ||
-				CardFeedbackNormalizeExpr(join->larg, allowed) ||
-				CardFeedbackNormalizeExpr(join->rarg, allowed) ||
-				CardFeedbackNormalizeExpr(join->quals, allowed);
+				CardFeedbackNormalizeExpr(join->larg, context) ||
+				CardFeedbackNormalizeExpr(join->rarg, context) ||
+				CardFeedbackNormalizeExpr(join->quals, context);
 		}
 		case T_List:
 			break;
@@ -230,6 +247,7 @@ CardFeedbackReadonlyContext(PlannerInfo *root)
 	StringInfoData key;
 	ListCell *lc;
 	Bitmapset *allowed = NULL;
+	FeedbackExprContext expr = {0};
 	int rti = 0;
 	Node *jointree;
 	char *serialized;
@@ -291,7 +309,8 @@ CardFeedbackReadonlyContext(PlannerInfo *root)
 	}
 	// selecting fewer columns or sorting rows still uses the same input count.
 	jointree = (Node *) copyObject(query->jointree);
-	if (CardFeedbackNormalizeExpr(jointree, allowed))
+	expr.relids = allowed;
+	if (CardFeedbackNormalizeExpr(jointree, &expr))
 	{
 		pfree(key.data);
 		return NULL;
@@ -309,6 +328,89 @@ CardFeedbackReadonlyContext(PlannerInfo *root)
 	return key.data;
 }
 
+// compare two filters as text so we can sort them.
+static int
+compare_clauses(const ListCell *a, const ListCell *b)
+{
+	return strcmp(lfirst(a), lfirst(b));
+}
+
+// put the length first, so 'ab' plus 'c' stays different from 'a' plus 'bc'.
+static void
+append_key_part(StringInfo key, const char *part)
+{
+	appendStringInfo(key, "%zu:%s", strlen(part), part);
+}
+
+// make the key, a label for all the filters used to count these rows.
+static bool
+append_restrictions(StringInfo key, List *restrictions,
+					FeedbackExprContext *expr)
+{
+	List *clauses = NIL;
+	ListCell *lc;
+
+	// check each filter the planner chose for this scan or join.
+	foreach(lc, restrictions)
+	{
+		RestrictInfo *restriction = lfirst_node(RestrictInfo, lc);
+		// edit a copy to make the label. the query still needs the original
+		// filter.
+		Node *clause = (Node *) copyObject(restriction->clause);
+
+		// a check like 1 = 0 has the same answer for every row. skip this
+		// key if a check is like that or we cannot use one of its filters.
+		if (restriction->pseudoconstant || CardFeedbackNormalizeExpr(clause, expr))
+		{
+			// one filter we cannot use is enough to drop this label. free
+			// the pieces we already made.
+			list_free_deep(clauses);
+			return false;
+		}
+		// turn the checked filter into text so it can be put in the label.
+		clauses = lappend(clauses, nodeToString(clause));
+	}
+	// a = 2 and b = 3 matches b = 3 and a = 2.
+	// the order here does not change which rows pass.
+	list_sort(clauses, compare_clauses);
+	// add each filter to the label in that order.
+	foreach(lc, clauses)
+		append_key_part(key, lfirst(lc));
+	list_free_deep(clauses);
+	return key->len < CARD_FEEDBACK_IDENTITY_BYTES;
+}
+
+// make a label for one table, the data we can see, and the filters we use.
+static char *
+CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
+{
+	FeedbackExprContext expr = {rel->relids, true};
+	// turn the table position in this query into the id of the table itself.
+	Oid relid = planner_rt_fetch(rel->relid, root)->relid;
+	Relation relation;
+	StringInfoData key;
+
+	// open the table so we can find where its data is stored.
+	relation = RelationIdGetRelation(relid);
+	if (!RelationIsValid(relation))
+		return NULL;
+	initStringInfo(&key);
+	// start with scan so this count stays separate from counts for joins.
+	appendStringInfoString(&key, "scan:");
+	append_snapshot_scope(&key);
+	appendStringInfo(&key, "%u:%u:%u:", relid,
+					 relation->rd_locator.spcOid, relation->rd_locator.relNumber);
+	RelationClose(relation);
+	// include filters postgresql works out.
+	// a.id = b.id and b.id = 3 can also give us a.id = 3.
+	if (!append_restrictions(&key, rel->baserestrictinfo, &expr))
+	{
+		pfree(key.data);
+		return NULL;
+	}
+	return key.data;
+}
+
 char *
 CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
 {
@@ -320,6 +422,15 @@ CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
 		!bms_is_subset(rel->relids, root->feedback_reuse_relids) ||
 		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL))
 		return NULL;
+	// look for a count for this table alone, even if this query is joining
+	// it to another table.
+	if (rel->reloptkind == RELOPT_BASEREL)
+	{
+		char *scan = CardFeedbackScanIdentity(root, rel);
+
+		if (scan != NULL)
+			return scan;
+	}
 	initStringInfo(&key);
 	appendStringInfo(&key, "%ssubset:", context);
 	while ((member = bms_next_member(rel->relids, member)) >= 0)
@@ -406,7 +517,6 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 {
 	CardFeedbackKey key;
 	CardFeedbackEntry *entry;
-	bool found;
 #ifdef CARD_FEEDBACK_PROFILE
 	bool profile = message_level_is_interesting(DEBUG2);
 	instr_time start, acquired, finished, evict_start, evict_end;
@@ -465,7 +575,7 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 				INSTR_TIME_SET_CURRENT(evict_end);
 #endif
 		}
-		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
+		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, NULL);
 		if (entry != NULL)
 		{
 			entry->identity[0] = '\0';

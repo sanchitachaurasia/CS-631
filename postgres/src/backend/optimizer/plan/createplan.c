@@ -5375,8 +5375,12 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->parallel_safe = src->parallel_safe;
 	/* Parameterized cardinalities are conditional and require separate keys. */
 	if (src->parent != NULL && src->param_info == NULL &&
-		(src->parent->reloptkind == RELOPT_BASEREL ||
-		 src->parent->reloptkind == RELOPT_JOINREL))
+		// keep counts for joins. for one table, carry the label only on a
+		// scan we can count.
+		(src->parent->reloptkind == RELOPT_JOINREL ||
+		 (src->parent->reloptkind == RELOPT_BASEREL &&
+		  (IsA(dest, SeqScan) || IsA(dest, IndexScan) ||
+		   IsA(dest, IndexOnlyScan) || IsA(dest, BitmapHeapScan)))))
 	{
 		dest->feedback_sig = src->parent->feedback_sig;
 		dest->feedback_identity = src->parent->feedback_identity;

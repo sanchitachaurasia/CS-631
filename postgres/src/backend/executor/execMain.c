@@ -115,35 +115,6 @@ CardFeedbackUnsupported(PlanState *ps, void *context)
 	return planstate_tree_walker(ps, CardFeedbackUnsupported, context);
 }
 
-/* Exact statement context, deliberately narrower than cross-query equivalence. */
-static uint64
-CardFeedbackRootKey(QueryDesc *qd)
-{
-	StringInfoData key;
-	ListCell *lc;
-	int start = Max(qd->plannedstmt->stmt_location, 0);
-	int length = qd->plannedstmt->stmt_len;
-	int rti = 0;
-	uint64 result;
-
-	if (length <= 0)
-		length = strlen(qd->sourceText + start);
-	initStringInfo(&key);
-	appendStringInfo(&key, "%u:%u:", MyDatabaseId, GetUserId());
-	appendBinaryStringInfo(&key, qd->sourceText + start, length);
-	foreach(lc, qd->plannedstmt->rtable)
-	{
-		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
-
-		appendStringInfo(&key, ":%d:%d:%u", ++rti, (int) rte->rtekind, rte->relid);
-	}
-	result = hash_bytes_extended((unsigned char *) key.data, key.len, 0);
-
-	// we only print the short number, so free the text used to make it.
-	pfree(key.data);
-	return result;
-}
-
 /* Descend only along inputs whose complete consumption has been established. */
 static void
 CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool root)
@@ -164,13 +135,8 @@ CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool root)
 	// query can use it.
 	if ((root || ps->plan->feedback_identity != NULL) &&
 		ps->plan->feedback_sig != 0)
-	{
 		CardFeedbackRecord(ps->plan->feedback_sig, ps->plan->raw_est_rows,
 						   instr->ntuples, ps->plan->feedback_identity);
-		ereport(DEBUG1,
-				(errmsg("card_feedback stored scope=subset signature=%llu actual=%.0f",
-						(unsigned long long) ps->plan->feedback_sig, instr->ntuples)));
-	}
 	switch (nodeTag(ps->plan))
 	{
 		case T_NestLoop:
@@ -205,34 +171,6 @@ CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool root)
 	}
 }
 
-// show the counts in the log. saving counts happens in a separate step.
-static bool
-ReportCardFeedbackRows(PlanState *ps, void *context)
-{
-	if (ps == NULL)
-		return false;
-	if (ps->instrument != NULL)
-	{
-		Instrumentation *instr = ps->instrument;
-
-		/* Idempotent after EXPLAIN has already finalized the loop. */
-		InstrEndLoop(instr);
-		if (instr->nloops > 0 && ps->plan->feedback_sig != 0)
-			ereport(DEBUG1,
-					(errmsg("card_feedback logical node=%d signature=%llu raw_estimated=%.0f validity=unverified",
-							ps->plan->plan_node_id,
-							(unsigned long long) ps->plan->feedback_sig,
-							ps->plan->raw_est_rows)));
-		if (instr->nloops > 0)
-			ereport(DEBUG1,
-					(errmsg("card_feedback diagnostic node=%d tag=%d estimated=%.0f actual_per_loop=%.0f loops=%.0f total=%.0f validity=unverified",
-							ps->plan->plan_node_id, (int) nodeTag(ps->plan),
-							ps->plan->plan_rows, instr->ntuples / instr->nloops,
-							instr->nloops, instr->ntuples)));
-	}
-	return planstate_tree_walker(ps, ReportCardFeedbackRows, context);
-}
-
 // start at the final step, then check which input steps have complete
 // counts.
 static void
@@ -247,17 +185,7 @@ CardFeedbackCollect(QueryDesc *qd)
 		!qd->plannedstmt->dependsOnRole &&
 		qd->plannedstmt->subplans == NIL && qd->params == NULL &&
 		!CardFeedbackUnsupported(root, NULL))
-	{
 		CollectCardFeedbackSubtree(root, true, true);
-		if (message_level_is_interesting(DEBUG1) && qd->sourceText != NULL &&
-			root->instrument != NULL && root->instrument->nloops == 1)
-			elog(DEBUG1, "card_feedback candidate scope=query_root key=" UINT64_FORMAT
-				 " estimated=%.0f actual=%.0f", CardFeedbackRootKey(qd),
-				 root->plan->plan_rows, root->instrument->ntuples);
-	}
-
-	if (message_level_is_interesting(DEBUG1))
-		ReportCardFeedbackRows(root, NULL);
 }
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */

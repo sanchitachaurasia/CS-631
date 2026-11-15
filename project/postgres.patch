@@ -14,7 +14,7 @@ index 1f947505af..ece34694d7 100644
        <entry><literal>AutoFile</literal></entry>
        <entry>Waiting to update the <filename>postgresql.auto.conf</filename>
 diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
-index 6a60fb3337..fdd5476a38 100644
+index 6a60fb3337..a881d8a8b2 100644
 --- a/src/backend/executor/execMain.c
 +++ b/src/backend/executor/execMain.c
 @@ -36,6 +36,10 @@
@@ -28,7 +28,7 @@ index 6a60fb3337..fdd5476a38 100644
  
  #include "access/heapam.h"
  #include "access/htup_details.h"
-@@ -69,6 +73,193 @@
+@@ -69,6 +73,121 @@
  #include "utils/snapmgr.h"
  
  
@@ -74,35 +74,6 @@ index 6a60fb3337..fdd5476a38 100644
 +	return planstate_tree_walker(ps, CardFeedbackUnsupported, context);
 +}
 +
-+/* Exact statement context, deliberately narrower than cross-query equivalence. */
-+static uint64
-+CardFeedbackRootKey(QueryDesc *qd)
-+{
-+	StringInfoData key;
-+	ListCell *lc;
-+	int start = Max(qd->plannedstmt->stmt_location, 0);
-+	int length = qd->plannedstmt->stmt_len;
-+	int rti = 0;
-+	uint64 result;
-+
-+	if (length <= 0)
-+		length = strlen(qd->sourceText + start);
-+	initStringInfo(&key);
-+	appendStringInfo(&key, "%u:%u:", MyDatabaseId, GetUserId());
-+	appendBinaryStringInfo(&key, qd->sourceText + start, length);
-+	foreach(lc, qd->plannedstmt->rtable)
-+	{
-+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
-+
-+		appendStringInfo(&key, ":%d:%d:%u", ++rti, (int) rte->rtekind, rte->relid);
-+	}
-+	result = hash_bytes_extended((unsigned char *) key.data, key.len, 0);
-+
-+	// we only print the short number, so free the text used to make it.
-+	pfree(key.data);
-+	return result;
-+}
-+
 +/* Descend only along inputs whose complete consumption has been established. */
 +static void
 +CollectCardFeedbackSubtree(PlanState *ps, bool complete, bool root)
@@ -123,13 +94,8 @@ index 6a60fb3337..fdd5476a38 100644
 +	// query can use it.
 +	if ((root || ps->plan->feedback_identity != NULL) &&
 +		ps->plan->feedback_sig != 0)
-+	{
 +		CardFeedbackRecord(ps->plan->feedback_sig, ps->plan->raw_est_rows,
 +						   instr->ntuples, ps->plan->feedback_identity);
-+		ereport(DEBUG1,
-+				(errmsg("card_feedback stored scope=subset signature=%llu actual=%.0f",
-+						(unsigned long long) ps->plan->feedback_sig, instr->ntuples)));
-+	}
 +	switch (nodeTag(ps->plan))
 +	{
 +		case T_NestLoop:
@@ -164,34 +130,6 @@ index 6a60fb3337..fdd5476a38 100644
 +	}
 +}
 +
-+// show the counts in the log. saving counts happens in a separate step.
-+static bool
-+ReportCardFeedbackRows(PlanState *ps, void *context)
-+{
-+	if (ps == NULL)
-+		return false;
-+	if (ps->instrument != NULL)
-+	{
-+		Instrumentation *instr = ps->instrument;
-+
-+		/* Idempotent after EXPLAIN has already finalized the loop. */
-+		InstrEndLoop(instr);
-+		if (instr->nloops > 0 && ps->plan->feedback_sig != 0)
-+			ereport(DEBUG1,
-+					(errmsg("card_feedback logical node=%d signature=%llu raw_estimated=%.0f validity=unverified",
-+							ps->plan->plan_node_id,
-+							(unsigned long long) ps->plan->feedback_sig,
-+							ps->plan->raw_est_rows)));
-+		if (instr->nloops > 0)
-+			ereport(DEBUG1,
-+					(errmsg("card_feedback diagnostic node=%d tag=%d estimated=%.0f actual_per_loop=%.0f loops=%.0f total=%.0f validity=unverified",
-+							ps->plan->plan_node_id, (int) nodeTag(ps->plan),
-+							ps->plan->plan_rows, instr->ntuples / instr->nloops,
-+							instr->nloops, instr->ntuples)));
-+	}
-+	return planstate_tree_walker(ps, ReportCardFeedbackRows, context);
-+}
-+
 +// start at the final step, then check which input steps have complete
 +// counts.
 +static void
@@ -206,23 +144,13 @@ index 6a60fb3337..fdd5476a38 100644
 +		!qd->plannedstmt->dependsOnRole &&
 +		qd->plannedstmt->subplans == NIL && qd->params == NULL &&
 +		!CardFeedbackUnsupported(root, NULL))
-+	{
 +		CollectCardFeedbackSubtree(root, true, true);
-+		if (message_level_is_interesting(DEBUG1) && qd->sourceText != NULL &&
-+			root->instrument != NULL && root->instrument->nloops == 1)
-+			elog(DEBUG1, "card_feedback candidate scope=query_root key=" UINT64_FORMAT
-+				 " estimated=%.0f actual=%.0f", CardFeedbackRootKey(qd),
-+				 root->plan->plan_rows, root->instrument->ntuples);
-+	}
-+
-+	if (message_level_is_interesting(DEBUG1))
-+		ReportCardFeedbackRows(root, NULL);
 +}
 +
  /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
  ExecutorStart_hook_type ExecutorStart_hook = NULL;
  ExecutorRun_hook_type ExecutorRun_hook = NULL;
-@@ -154,6 +345,11 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
+@@ -154,6 +273,11 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
  	Assert(queryDesc != NULL);
  	Assert(queryDesc->estate == NULL);
  
@@ -234,7 +162,7 @@ index 6a60fb3337..fdd5476a38 100644
  	/*
  	 * If the transaction is read-only, we need to check if any writes are
  	 * planned to non-temporary tables.  EXPLAIN is considered read-only.
-@@ -493,6 +689,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
+@@ -493,6 +617,10 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
  	 */
  	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
  
@@ -245,7 +173,7 @@ index 6a60fb3337..fdd5476a38 100644
  	ExecEndPlan(queryDesc->planstate, estate);
  
  	/* do away with our snapshots */
-@@ -548,6 +748,7 @@ ExecutorRewind(QueryDesc *queryDesc)
+@@ -548,6 +676,7 @@ ExecutorRewind(QueryDesc *queryDesc)
  	/*
  	 * rescan plan
  	 */
@@ -253,7 +181,7 @@ index 6a60fb3337..fdd5476a38 100644
  	ExecReScan(queryDesc->planstate);
  
  	MemoryContextSwitchTo(oldcontext);
-@@ -1687,6 +1888,11 @@ ExecutePlan(QueryDesc *queryDesc,
+@@ -1687,6 +1816,11 @@ ExecutePlan(QueryDesc *queryDesc,
  	 * initialize local variables
  	 */
  	current_tuple_count = 0;
@@ -265,7 +193,7 @@ index 6a60fb3337..fdd5476a38 100644
  
  	/*
  	 * Set the direction.
-@@ -1728,7 +1934,10 @@ ExecutePlan(QueryDesc *queryDesc,
+@@ -1728,7 +1862,10 @@ ExecutePlan(QueryDesc *queryDesc,
  		 * process so we just end the loop...
  		 */
  		if (TupIsNull(slot))
@@ -290,10 +218,10 @@ index 1e199ff66f..0931a42e75 100644
  	equivclass.o \
 diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
 new file mode 100644
-index 0000000000..883881bfa6
+index 0000000000..6a4af2ceef
 --- /dev/null
 +++ b/src/backend/optimizer/path/card_feedback.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,705 @@
 +/* save complete row counts and use them when postgresql picks a plan. */
 +#include "postgres.h"
 +
@@ -373,11 +301,17 @@ index 0000000000..883881bfa6
 +		!type_is_rowtype(type);
 +}
 +
++typedef struct FeedbackExprContext
++{
++	const Bitmapset *relids;
++	bool single_table;
++} FeedbackExprContext;
++
 +/* ignore where the filter was written, so select and explain can match. */
 +static bool
 +CardFeedbackNormalizeExpr(Node *node, void *context)
 +{
-+	Bitmapset *allowed = (Bitmapset *) context;
++	FeedbackExprContext *expr = context;
 +
 +	if (node == NULL)
 +		return false;
@@ -387,9 +321,20 @@ index 0000000000..883881bfa6
 +		{
 +			Var *var = (Var *) node;
 +
-+			if (!bms_is_member(var->varno, allowed) || var->varlevelsup != 0 ||
++			if (!bms_is_member(var->varno, expr->relids) || var->varlevelsup != 0 ||
 +				var->varattno <= 0 || !safe_type(var->vartype))
 +				return true;
++			// call it table one in this label, even if it came second in the
++			// query.
++			if (expr->single_table)
++			{
++				// a left join can give us a null instead of the original
++				// column value. skip making a key for sharing that count.
++				if (!bms_is_empty(var->varnullingrels))
++					return true;
++				var->varno = var->varnosyn = 1;
++				var->varattnosyn = var->varattno;
++			}
 +			var->location = -1;
 +			return false;
 +		}
@@ -453,25 +398,25 @@ index 0000000000..883881bfa6
 +			((BoolExpr *) node)->location = -1;
 +			break;
 +		case T_RangeTblRef:
-+			return !bms_is_member(((RangeTblRef *) node)->rtindex, allowed);
++			return !bms_is_member(((RangeTblRef *) node)->rtindex, expr->relids);
 +		case T_FromExpr:
 +		{
 +			FromExpr *from = (FromExpr *) node;
 +			ListCell *lc;
 +
 +			foreach(lc, from->fromlist)
-+				if (CardFeedbackNormalizeExpr(lfirst(lc), allowed))
++				if (CardFeedbackNormalizeExpr(lfirst(lc), context))
 +					return true;
-+			return CardFeedbackNormalizeExpr(from->quals, allowed);
++			return CardFeedbackNormalizeExpr(from->quals, context);
 +		}
 +		case T_JoinExpr:
 +		{
 +			JoinExpr *join = (JoinExpr *) node;
 +
 +			return join->jointype != JOIN_INNER ||
-+				CardFeedbackNormalizeExpr(join->larg, allowed) ||
-+				CardFeedbackNormalizeExpr(join->rarg, allowed) ||
-+				CardFeedbackNormalizeExpr(join->quals, allowed);
++				CardFeedbackNormalizeExpr(join->larg, context) ||
++				CardFeedbackNormalizeExpr(join->rarg, context) ||
++				CardFeedbackNormalizeExpr(join->quals, context);
 +		}
 +		case T_List:
 +			break;
@@ -526,6 +471,7 @@ index 0000000000..883881bfa6
 +	StringInfoData key;
 +	ListCell *lc;
 +	Bitmapset *allowed = NULL;
++	FeedbackExprContext expr = {0};
 +	int rti = 0;
 +	Node *jointree;
 +	char *serialized;
@@ -587,7 +533,8 @@ index 0000000000..883881bfa6
 +	}
 +	// selecting fewer columns or sorting rows still uses the same input count.
 +	jointree = (Node *) copyObject(query->jointree);
-+	if (CardFeedbackNormalizeExpr(jointree, allowed))
++	expr.relids = allowed;
++	if (CardFeedbackNormalizeExpr(jointree, &expr))
 +	{
 +		pfree(key.data);
 +		return NULL;
@@ -605,6 +552,89 @@ index 0000000000..883881bfa6
 +	return key.data;
 +}
 +
++// compare two filters as text so we can sort them.
++static int
++compare_clauses(const ListCell *a, const ListCell *b)
++{
++	return strcmp(lfirst(a), lfirst(b));
++}
++
++// put the length first, so 'ab' plus 'c' stays different from 'a' plus 'bc'.
++static void
++append_key_part(StringInfo key, const char *part)
++{
++	appendStringInfo(key, "%zu:%s", strlen(part), part);
++}
++
++// make the key, a label for all the filters used to count these rows.
++static bool
++append_restrictions(StringInfo key, List *restrictions,
++					FeedbackExprContext *expr)
++{
++	List *clauses = NIL;
++	ListCell *lc;
++
++	// check each filter the planner chose for this scan or join.
++	foreach(lc, restrictions)
++	{
++		RestrictInfo *restriction = lfirst_node(RestrictInfo, lc);
++		// edit a copy to make the label. the query still needs the original
++		// filter.
++		Node *clause = (Node *) copyObject(restriction->clause);
++
++		// a check like 1 = 0 has the same answer for every row. skip this
++		// key if a check is like that or we cannot use one of its filters.
++		if (restriction->pseudoconstant || CardFeedbackNormalizeExpr(clause, expr))
++		{
++			// one filter we cannot use is enough to drop this label. free
++			// the pieces we already made.
++			list_free_deep(clauses);
++			return false;
++		}
++		// turn the checked filter into text so it can be put in the label.
++		clauses = lappend(clauses, nodeToString(clause));
++	}
++	// a = 2 and b = 3 matches b = 3 and a = 2.
++	// the order here does not change which rows pass.
++	list_sort(clauses, compare_clauses);
++	// add each filter to the label in that order.
++	foreach(lc, clauses)
++		append_key_part(key, lfirst(lc));
++	list_free_deep(clauses);
++	return key->len < CARD_FEEDBACK_IDENTITY_BYTES;
++}
++
++// make a label for one table, the data we can see, and the filters we use.
++static char *
++CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
++{
++	FeedbackExprContext expr = {rel->relids, true};
++	// turn the table position in this query into the id of the table itself.
++	Oid relid = planner_rt_fetch(rel->relid, root)->relid;
++	Relation relation;
++	StringInfoData key;
++
++	// open the table so we can find where its data is stored.
++	relation = RelationIdGetRelation(relid);
++	if (!RelationIsValid(relation))
++		return NULL;
++	initStringInfo(&key);
++	// start with scan so this count stays separate from counts for joins.
++	appendStringInfoString(&key, "scan:");
++	append_snapshot_scope(&key);
++	appendStringInfo(&key, "%u:%u:%u:", relid,
++					 relation->rd_locator.spcOid, relation->rd_locator.relNumber);
++	RelationClose(relation);
++	// include filters postgresql works out.
++	// a.id = b.id and b.id = 3 can also give us a.id = 3.
++	if (!append_restrictions(&key, rel->baserestrictinfo, &expr))
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	return key.data;
++}
++
 +char *
 +CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
 +{
@@ -616,6 +646,15 @@ index 0000000000..883881bfa6
 +		!bms_is_subset(rel->relids, root->feedback_reuse_relids) ||
 +		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL))
 +		return NULL;
++	// look for a count for this table alone, even if this query is joining
++	// it to another table.
++	if (rel->reloptkind == RELOPT_BASEREL)
++	{
++		char *scan = CardFeedbackScanIdentity(root, rel);
++
++		if (scan != NULL)
++			return scan;
++	}
 +	initStringInfo(&key);
 +	appendStringInfo(&key, "%ssubset:", context);
 +	while ((member = bms_next_member(rel->relids, member)) >= 0)
@@ -702,7 +741,6 @@ index 0000000000..883881bfa6
 +{
 +	CardFeedbackKey key;
 +	CardFeedbackEntry *entry;
-+	bool found;
 +#ifdef CARD_FEEDBACK_PROFILE
 +	bool profile = message_level_is_interesting(DEBUG2);
 +	instr_time start, acquired, finished, evict_start, evict_end;
@@ -761,7 +799,7 @@ index 0000000000..883881bfa6
 +				INSTR_TIME_SET_CURRENT(evict_end);
 +#endif
 +		}
-+		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, &found);
++		entry = hash_search(CardFeedbackHash, &key, HASH_ENTER_NULL, NULL);
 +		if (entry != NULL)
 +		{
 +			entry->identity[0] = '\0';
@@ -890,7 +928,7 @@ index 0000000000..883881bfa6
 +	return found;
 +}
 diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
-index 38b287437d..f11597942d 100644
+index 38b287437d..8bd9289295 100644
 --- a/src/backend/optimizer/path/costsize.c
 +++ b/src/backend/optimizer/path/costsize.c
 @@ -70,6 +70,8 @@
@@ -902,7 +940,7 @@ index 38b287437d..f11597942d 100644
  
  #include <limits.h>
  #include <math.h>
-@@ -4997,6 +4999,37 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
+@@ -4997,6 +4999,39 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
  }
  
  
@@ -932,15 +970,17 @@ index 38b287437d..f11597942d 100644
 +		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
 +	{
 +		rel->rows = clamp_row_est(learned_rows);
-+		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f",
-+			 rel->feedback_sig, rel->raw_est_rows, learned_rows);
++		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
++			 rel->feedback_sig, rel->raw_est_rows, learned_rows,
++			 strncmp(rel->feedback_identity, "scan:", 5) == 0 ? "scan" : "query",
++			 rel->relid);
 +	}
 +}
 +
  /*
   * set_baserel_size_estimates
   *		Set the size estimates for the given base relation.
-@@ -5026,6 +5059,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+@@ -5026,6 +5061,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
  							   NULL);
  
  	rel->rows = clamp_row_est(nrows);
@@ -948,7 +988,7 @@ index 38b287437d..f11597942d 100644
  
  	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
  
-@@ -5104,6 +5138,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+@@ -5104,6 +5140,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  										   inner_rel->rows,
  										   sjinfo,
  										   restrictlist);
@@ -970,17 +1010,21 @@ index b8871fd2d2..5c48844e1a 100644
    'costsize.c',
    'equivclass.c',
 diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
-index 942392218c..d6ebfa3f14 100644
+index 942392218c..754bd823a3 100644
 --- a/src/backend/optimizer/plan/createplan.c
 +++ b/src/backend/optimizer/plan/createplan.c
-@@ -5373,6 +5373,16 @@ copy_generic_path_info(Plan *dest, Path *src)
+@@ -5373,6 +5373,20 @@ copy_generic_path_info(Plan *dest, Path *src)
  	dest->plan_width = src->pathtarget->width;
  	dest->parallel_aware = src->parallel_aware;
  	dest->parallel_safe = src->parallel_safe;
 +	/* Parameterized cardinalities are conditional and require separate keys. */
 +	if (src->parent != NULL && src->param_info == NULL &&
-+		(src->parent->reloptkind == RELOPT_BASEREL ||
-+		 src->parent->reloptkind == RELOPT_JOINREL))
++		// keep counts for joins. for one table, carry the label only on a
++		// scan we can count.
++		(src->parent->reloptkind == RELOPT_JOINREL ||
++		 (src->parent->reloptkind == RELOPT_BASEREL &&
++		  (IsA(dest, SeqScan) || IsA(dest, IndexScan) ||
++		   IsA(dest, IndexOnlyScan) || IsA(dest, BitmapHeapScan)))))
 +	{
 +		dest->feedback_sig = src->parent->feedback_sig;
 +		dest->feedback_identity = src->parent->feedback_identity;

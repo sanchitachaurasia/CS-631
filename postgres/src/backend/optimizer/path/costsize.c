@@ -5025,8 +5025,10 @@ CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
 		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
 	{
 		rel->rows = clamp_row_est(learned_rows);
-		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f",
-			 rel->feedback_sig, rel->raw_est_rows, learned_rows);
+		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
+			 rel->feedback_sig, rel->raw_est_rows, learned_rows,
+			 strncmp(rel->feedback_identity, "scan:", 5) == 0 ? "scan" : "query",
+			 rel->relid);
 	}
 }
 
