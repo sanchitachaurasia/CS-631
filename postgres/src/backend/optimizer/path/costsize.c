@@ -5001,7 +5001,7 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 
 /* check for a saved count after estimating a scan or inner join. */
 static void
-CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
+CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 {
 	double learned_rows;
 
@@ -5009,7 +5009,7 @@ CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
 	if (!enable_card_feedback_collect && !enable_card_feedback_apply)
 		return;
 	rel->raw_est_rows = rel->rows;
-	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
+	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel, restrictlist);
 	// if this count cannot be reused, give it a short label just for display
 	// when collecting is on.
 	if (rel->feedback_identity == NULL)
@@ -5024,11 +5024,15 @@ CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
 	if (enable_card_feedback_apply &&
 		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
 	{
+		const char *scope = "query";
+
+		if (strncmp(rel->feedback_identity, "scan:", 5) == 0)
+			scope = "scan";
+		else if (strncmp(rel->feedback_identity, "pair:", 5) == 0)
+			scope = "pair";
 		rel->rows = clamp_row_est(learned_rows);
 		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
-			 rel->feedback_sig, rel->raw_est_rows, learned_rows,
-			 strncmp(rel->feedback_identity, "scan:", 5) == 0 ? "scan" : "query",
-			 rel->relid);
+			 rel->feedback_sig, rel->raw_est_rows, learned_rows, scope, rel->relid);
 	}
 }
 
@@ -5061,7 +5065,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 							   NULL);
 
 	rel->rows = clamp_row_est(nrows);
-	CardFeedbackEstimate(root, rel);
+	// there are no join conditions for one table, so pass an empty list.
+	CardFeedbackEstimate(root, rel, NIL);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
@@ -5141,7 +5146,9 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 										   sjinfo,
 										   restrictlist);
 	if (sjinfo->jointype == JOIN_INNER)
-		CardFeedbackEstimate(root, rel);
+		// pass the filters used at this join, which can be different from
+		// the filters for the whole query.
+		CardFeedbackEstimate(root, rel, restrictlist);
 }
 
 /*

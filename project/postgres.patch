@@ -218,10 +218,10 @@ index 1e199ff66f..0931a42e75 100644
  	equivclass.o \
 diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
 new file mode 100644
-index 0000000000..6a4af2ceef
+index 0000000000..946224bbb0
 --- /dev/null
 +++ b/src/backend/optimizer/path/card_feedback.c
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,812 @@
 +/* save complete row counts and use them when postgresql picks a plan. */
 +#include "postgres.h"
 +
@@ -242,6 +242,7 @@ index 0000000000..6a4af2ceef
 +#include "miscadmin.h"
 +#include "nodes/print.h"
 +#include "optimizer/card_feedback.h"
++#include "optimizer/clauses.h"
 +#include "parser/parsetree.h"
 +#include "storage/lwlock.h"
 +#include "storage/shmem.h"
@@ -304,7 +305,7 @@ index 0000000000..6a4af2ceef
 +typedef struct FeedbackExprContext
 +{
 +	const Bitmapset *relids;
-+	bool single_table;
++	Index first_table;			/* zero keeps the original range-table positions */
 +} FeedbackExprContext;
 +
 +/* ignore where the filter was written, so select and explain can match. */
@@ -324,15 +325,15 @@ index 0000000000..6a4af2ceef
 +			if (!bms_is_member(var->varno, expr->relids) || var->varlevelsup != 0 ||
 +				var->varattno <= 0 || !safe_type(var->vartype))
 +				return true;
-+			// call it table one in this label, even if it came second in the
-+			// query.
-+			if (expr->single_table)
++			// call the two tables one and two in the label, so changing
++			// their positions in the query will not change it.
++			if (expr->first_table != 0)
 +			{
 +				// a left join can give us a null instead of the original
 +				// column value. skip making a key for sharing that count.
 +				if (!bms_is_empty(var->varnullingrels))
 +					return true;
-+				var->varno = var->varnosyn = 1;
++				var->varno = var->varnosyn = var->varno == expr->first_table ? 1 : 2;
 +				var->varattnosyn = var->varattno;
 +			}
 +			var->location = -1;
@@ -566,10 +567,47 @@ index 0000000000..6a4af2ceef
 +	appendStringInfo(key, "%zu:%s", strlen(part), part);
 +}
 +
++// put the two sides of an equals check in the same order each time.
++static bool
++order_join_clause(RestrictInfo *restriction, Node *clause, Index first)
++{
++	OpExpr *op;
++	Var *left;
++	Var *right;
++
++	// use an equals check like a.id = b.id to share a count.
++	// a join on a.id < b.id can still use its count in the same query.
++	if (restriction->mergeopfamilies == NIL || !IsA(clause, OpExpr))
++		return false;
++	// keep it simple, like a.id = b.id. an expression like a.id + 1 is not a
++	// plain column.
++	op = (OpExpr *) clause;
++	if (op->opno >= FirstGenbkiObjectId || list_length(op->args) != 2 ||
++		!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
++		return false;
++
++	left = linitial_node(Var, op->args);
++	right = lsecond_node(Var, op->args);
++	// a.id = a.other_id only uses a, so it does not connect the two tables.
++	if (left->varno == right->varno)
++		return false;
++	if (left->varno != first)
++	{
++		// ask postgresql how to flip the check, so b.id = a.id matches a.id
++		// = b.id.
++		Oid commutator = get_commutator(op->opno);
++
++		if (!OidIsValid(commutator) || commutator >= FirstGenbkiObjectId)
++			return false;
++		CommuteOpExpr(op);
++	}
++	return true;
++}
++
 +// make the key, a label for all the filters used to count these rows.
 +static bool
 +append_restrictions(StringInfo key, List *restrictions,
-+					FeedbackExprContext *expr)
++					FeedbackExprContext *expr, bool join)
 +{
 +	List *clauses = NIL;
 +	ListCell *lc;
@@ -584,7 +622,11 @@ index 0000000000..6a4af2ceef
 +
 +		// a check like 1 = 0 has the same answer for every row. skip this
 +		// key if a check is like that or we cannot use one of its filters.
-+		if (restriction->pseudoconstant || CardFeedbackNormalizeExpr(clause, expr))
++		if (restriction->pseudoconstant ||
++			// a join needs a check like a.id = b.id here. a filter on one
++			// table can still use id < 5.
++			(join && !order_join_clause(restriction, clause, expr->first_table)) ||
++			CardFeedbackNormalizeExpr(clause, expr))
 +		{
 +			// one filter we cannot use is enough to drop this label. free
 +			// the pieces we already made.
@@ -608,7 +650,7 @@ index 0000000000..6a4af2ceef
 +static char *
 +CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
 +{
-+	FeedbackExprContext expr = {rel->relids, true};
++	FeedbackExprContext expr = {rel->relids, rel->relid};
 +	// turn the table position in this query into the id of the table itself.
 +	Oid relid = planner_rt_fetch(rel->relid, root)->relid;
 +	Relation relation;
@@ -627,7 +669,72 @@ index 0000000000..6a4af2ceef
 +	RelationClose(relation);
 +	// include filters postgresql works out.
 +	// a.id = b.id and b.id = 3 can also give us a.id = 3.
-+	if (!append_restrictions(&key, rel->baserestrictinfo, &expr))
++	if (!append_restrictions(&key, rel->baserestrictinfo, &expr, false))
++	{
++		pfree(key.data);
++		return NULL;
++	}
++	return key.data;
++}
++
++// make a label from the two table filters and the check that joins them.
++static char *
++CardFeedbackPairIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
++{
++	Index first;
++	Index second;
++	Oid first_oid;
++	Oid second_oid;
++	const char *left;
++	const char *right;
++	FeedbackExprContext expr;
++	StringInfoData key;
++
++	// share a count for two tables with a join condition. a cross join uses
++	// the label for its own query.
++	if (restrictlist == NIL || bms_num_members(rel->relids) != 2)
++		return NULL;
++	// find the ids of the two tables, even if they have different names in
++	// this query.
++	first = bms_next_member(rel->relids, -1);
++	second = bms_next_member(rel->relids, first);
++	first_oid = planner_rt_fetch(first, root)->relid;
++	second_oid = planner_rt_fetch(second, root)->relid;
++	// items a join items b on a.id = b.id uses the same table twice.
++	// skip sharing this join count with other queries. it can still match
++	// when the same query runs again.
++	if (first_oid == second_oid)
++		return NULL;
++	// sort by table id so a join b can match b join a when the filters are
++	// the same.
++	if (first_oid > second_oid)
++	{
++		Index tmp = first;
++
++		first = second;
++		second = tmp;
++	}
++	// use the labels we made for each table, so both sets of filters are
++	// part of this join label.
++	left = root->simple_rel_array[first]->feedback_identity;
++	right = root->simple_rel_array[second]->feedback_identity;
++	// each table needs a label we can use on its own. a label tied to this
++	// whole query cannot be shared.
++	if (left == NULL || right == NULL ||
++		strncmp(left, "scan:", 5) != 0 || strncmp(right, "scan:", 5) != 0)
++		return NULL;
++
++	expr.relids = rel->relids;
++	expr.first_table = first;
++	initStringInfo(&key);
++	// start with pair so a join count cannot be mistaken for a count from
++	// one table.
++	appendStringInfoString(&key, "pair:");
++	append_key_part(&key, left);
++	append_key_part(&key, right);
++	// a.id = b.id and a.code = b.code can match different rows.
++	// include the join condition so they get different labels.
++	if (!append_restrictions(&key, restrictlist, &expr, true))
 +	{
 +		pfree(key.data);
 +		return NULL;
@@ -636,9 +743,10 @@ index 0000000000..6a4af2ceef
 +}
 +
 +char *
-+CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
++CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 +{
 +	const char *context = CardFeedbackReadonlyContext(root);
++	char *identity;
 +	StringInfoData key;
 +	int member = -1;
 +
@@ -646,15 +754,14 @@ index 0000000000..6a4af2ceef
 +		!bms_is_subset(rel->relids, root->feedback_reuse_relids) ||
 +		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL))
 +		return NULL;
-+	// look for a count for this table alone, even if this query is joining
-+	// it to another table.
++	// look for a count we can share first. if there is no way to name it for
++	// sharing, use a label tied to this query.
 +	if (rel->reloptkind == RELOPT_BASEREL)
-+	{
-+		char *scan = CardFeedbackScanIdentity(root, rel);
-+
-+		if (scan != NULL)
-+			return scan;
-+	}
++		identity = CardFeedbackScanIdentity(root, rel);
++	else
++		identity = CardFeedbackPairIdentity(root, rel, restrictlist);
++	if (identity != NULL)
++		return identity;
 +	initStringInfo(&key);
 +	appendStringInfo(&key, "%ssubset:", context);
 +	while ((member = bms_next_member(rel->relids, member)) >= 0)
@@ -928,7 +1035,7 @@ index 0000000000..6a4af2ceef
 +	return found;
 +}
 diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
-index 38b287437d..8bd9289295 100644
+index 38b287437d..31dd1bae6e 100644
 --- a/src/backend/optimizer/path/costsize.c
 +++ b/src/backend/optimizer/path/costsize.c
 @@ -70,6 +70,8 @@
@@ -940,13 +1047,13 @@ index 38b287437d..8bd9289295 100644
  
  #include <limits.h>
  #include <math.h>
-@@ -4997,6 +4999,39 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
+@@ -4997,6 +4999,43 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
  }
  
  
 +/* check for a saved count after estimating a scan or inner join. */
 +static void
-+CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel)
++CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 +{
 +	double learned_rows;
 +
@@ -954,7 +1061,7 @@ index 38b287437d..8bd9289295 100644
 +	if (!enable_card_feedback_collect && !enable_card_feedback_apply)
 +		return;
 +	rel->raw_est_rows = rel->rows;
-+	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel);
++	rel->feedback_identity = CardFeedbackReadonlyIdentity(root, rel, restrictlist);
 +	// if this count cannot be reused, give it a short label just for display
 +	// when collecting is on.
 +	if (rel->feedback_identity == NULL)
@@ -969,31 +1076,38 @@ index 38b287437d..8bd9289295 100644
 +	if (enable_card_feedback_apply &&
 +		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
 +	{
++		const char *scope = "query";
++
++		if (strncmp(rel->feedback_identity, "scan:", 5) == 0)
++			scope = "scan";
++		else if (strncmp(rel->feedback_identity, "pair:", 5) == 0)
++			scope = "pair";
 +		rel->rows = clamp_row_est(learned_rows);
 +		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
-+			 rel->feedback_sig, rel->raw_est_rows, learned_rows,
-+			 strncmp(rel->feedback_identity, "scan:", 5) == 0 ? "scan" : "query",
-+			 rel->relid);
++			 rel->feedback_sig, rel->raw_est_rows, learned_rows, scope, rel->relid);
 +	}
 +}
 +
  /*
   * set_baserel_size_estimates
   *		Set the size estimates for the given base relation.
-@@ -5026,6 +5061,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+@@ -5026,6 +5065,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
  							   NULL);
  
  	rel->rows = clamp_row_est(nrows);
-+	CardFeedbackEstimate(root, rel);
++	// there are no join conditions for one table, so pass an empty list.
++	CardFeedbackEstimate(root, rel, NIL);
  
  	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
  
-@@ -5104,6 +5140,8 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+@@ -5104,6 +5145,10 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  										   inner_rel->rows,
  										   sjinfo,
  										   restrictlist);
 +	if (sjinfo->jointype == JOIN_INNER)
-+		CardFeedbackEstimate(root, rel);
++		// pass the filters used at this join, which can be different from
++		// the filters for the whole query.
++		CardFeedbackEstimate(root, rel, restrictlist);
  }
  
  /*
@@ -1209,7 +1323,7 @@ index d64fe6a328..9b19ea9cb7 100644
  
 diff --git a/src/include/optimizer/card_feedback.h b/src/include/optimizer/card_feedback.h
 new file mode 100644
-index 0000000000..3e33969db9
+index 0000000000..405635256b
 --- /dev/null
 +++ b/src/include/optimizer/card_feedback.h
 @@ -0,0 +1,43 @@
@@ -1227,7 +1341,7 @@ index 0000000000..3e33969db9
 +
 +extern PGDLLIMPORT bool enable_card_feedback_apply;
 +extern int card_feedback_cached_plan_depth;
-+extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel);
++extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist);
 +extern bool CardFeedbackLookup(uint64 signature, const char *identity, double *rows);
 +
 +typedef struct CardFeedbackKey

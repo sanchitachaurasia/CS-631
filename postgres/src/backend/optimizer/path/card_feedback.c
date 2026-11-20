@@ -18,6 +18,7 @@
 #include "miscadmin.h"
 #include "nodes/print.h"
 #include "optimizer/card_feedback.h"
+#include "optimizer/clauses.h"
 #include "parser/parsetree.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -80,7 +81,7 @@ safe_type(Oid type)
 typedef struct FeedbackExprContext
 {
 	const Bitmapset *relids;
-	bool single_table;
+	Index first_table;			/* zero keeps the original range-table positions */
 } FeedbackExprContext;
 
 /* ignore where the filter was written, so select and explain can match. */
@@ -100,15 +101,15 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 			if (!bms_is_member(var->varno, expr->relids) || var->varlevelsup != 0 ||
 				var->varattno <= 0 || !safe_type(var->vartype))
 				return true;
-			// call it table one in this label, even if it came second in the
-			// query.
-			if (expr->single_table)
+			// call the two tables one and two in the label, so changing
+			// their positions in the query will not change it.
+			if (expr->first_table != 0)
 			{
 				// a left join can give us a null instead of the original
 				// column value. skip making a key for sharing that count.
 				if (!bms_is_empty(var->varnullingrels))
 					return true;
-				var->varno = var->varnosyn = 1;
+				var->varno = var->varnosyn = var->varno == expr->first_table ? 1 : 2;
 				var->varattnosyn = var->varattno;
 			}
 			var->location = -1;
@@ -342,10 +343,47 @@ append_key_part(StringInfo key, const char *part)
 	appendStringInfo(key, "%zu:%s", strlen(part), part);
 }
 
+// put the two sides of an equals check in the same order each time.
+static bool
+order_join_clause(RestrictInfo *restriction, Node *clause, Index first)
+{
+	OpExpr *op;
+	Var *left;
+	Var *right;
+
+	// use an equals check like a.id = b.id to share a count.
+	// a join on a.id < b.id can still use its count in the same query.
+	if (restriction->mergeopfamilies == NIL || !IsA(clause, OpExpr))
+		return false;
+	// keep it simple, like a.id = b.id. an expression like a.id + 1 is not a
+	// plain column.
+	op = (OpExpr *) clause;
+	if (op->opno >= FirstGenbkiObjectId || list_length(op->args) != 2 ||
+		!IsA(linitial(op->args), Var) || !IsA(lsecond(op->args), Var))
+		return false;
+
+	left = linitial_node(Var, op->args);
+	right = lsecond_node(Var, op->args);
+	// a.id = a.other_id only uses a, so it does not connect the two tables.
+	if (left->varno == right->varno)
+		return false;
+	if (left->varno != first)
+	{
+		// ask postgresql how to flip the check, so b.id = a.id matches a.id
+		// = b.id.
+		Oid commutator = get_commutator(op->opno);
+
+		if (!OidIsValid(commutator) || commutator >= FirstGenbkiObjectId)
+			return false;
+		CommuteOpExpr(op);
+	}
+	return true;
+}
+
 // make the key, a label for all the filters used to count these rows.
 static bool
 append_restrictions(StringInfo key, List *restrictions,
-					FeedbackExprContext *expr)
+					FeedbackExprContext *expr, bool join)
 {
 	List *clauses = NIL;
 	ListCell *lc;
@@ -360,7 +398,11 @@ append_restrictions(StringInfo key, List *restrictions,
 
 		// a check like 1 = 0 has the same answer for every row. skip this
 		// key if a check is like that or we cannot use one of its filters.
-		if (restriction->pseudoconstant || CardFeedbackNormalizeExpr(clause, expr))
+		if (restriction->pseudoconstant ||
+			// a join needs a check like a.id = b.id here. a filter on one
+			// table can still use id < 5.
+			(join && !order_join_clause(restriction, clause, expr->first_table)) ||
+			CardFeedbackNormalizeExpr(clause, expr))
 		{
 			// one filter we cannot use is enough to drop this label. free
 			// the pieces we already made.
@@ -384,7 +426,7 @@ append_restrictions(StringInfo key, List *restrictions,
 static char *
 CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
 {
-	FeedbackExprContext expr = {rel->relids, true};
+	FeedbackExprContext expr = {rel->relids, rel->relid};
 	// turn the table position in this query into the id of the table itself.
 	Oid relid = planner_rt_fetch(rel->relid, root)->relid;
 	Relation relation;
@@ -403,7 +445,72 @@ CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
 	RelationClose(relation);
 	// include filters postgresql works out.
 	// a.id = b.id and b.id = 3 can also give us a.id = 3.
-	if (!append_restrictions(&key, rel->baserestrictinfo, &expr))
+	if (!append_restrictions(&key, rel->baserestrictinfo, &expr, false))
+	{
+		pfree(key.data);
+		return NULL;
+	}
+	return key.data;
+}
+
+// make a label from the two table filters and the check that joins them.
+static char *
+CardFeedbackPairIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
+{
+	Index first;
+	Index second;
+	Oid first_oid;
+	Oid second_oid;
+	const char *left;
+	const char *right;
+	FeedbackExprContext expr;
+	StringInfoData key;
+
+	// share a count for two tables with a join condition. a cross join uses
+	// the label for its own query.
+	if (restrictlist == NIL || bms_num_members(rel->relids) != 2)
+		return NULL;
+	// find the ids of the two tables, even if they have different names in
+	// this query.
+	first = bms_next_member(rel->relids, -1);
+	second = bms_next_member(rel->relids, first);
+	first_oid = planner_rt_fetch(first, root)->relid;
+	second_oid = planner_rt_fetch(second, root)->relid;
+	// items a join items b on a.id = b.id uses the same table twice.
+	// skip sharing this join count with other queries. it can still match
+	// when the same query runs again.
+	if (first_oid == second_oid)
+		return NULL;
+	// sort by table id so a join b can match b join a when the filters are
+	// the same.
+	if (first_oid > second_oid)
+	{
+		Index tmp = first;
+
+		first = second;
+		second = tmp;
+	}
+	// use the labels we made for each table, so both sets of filters are
+	// part of this join label.
+	left = root->simple_rel_array[first]->feedback_identity;
+	right = root->simple_rel_array[second]->feedback_identity;
+	// each table needs a label we can use on its own. a label tied to this
+	// whole query cannot be shared.
+	if (left == NULL || right == NULL ||
+		strncmp(left, "scan:", 5) != 0 || strncmp(right, "scan:", 5) != 0)
+		return NULL;
+
+	expr.relids = rel->relids;
+	expr.first_table = first;
+	initStringInfo(&key);
+	// start with pair so a join count cannot be mistaken for a count from
+	// one table.
+	appendStringInfoString(&key, "pair:");
+	append_key_part(&key, left);
+	append_key_part(&key, right);
+	// a.id = b.id and a.code = b.code can match different rows.
+	// include the join condition so they get different labels.
+	if (!append_restrictions(&key, restrictlist, &expr, true))
 	{
 		pfree(key.data);
 		return NULL;
@@ -412,9 +519,10 @@ CardFeedbackScanIdentity(PlannerInfo *root, RelOptInfo *rel)
 }
 
 char *
-CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
+CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 {
 	const char *context = CardFeedbackReadonlyContext(root);
+	char *identity;
 	StringInfoData key;
 	int member = -1;
 
@@ -422,15 +530,14 @@ CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel)
 		!bms_is_subset(rel->relids, root->feedback_reuse_relids) ||
 		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_JOINREL))
 		return NULL;
-	// look for a count for this table alone, even if this query is joining
-	// it to another table.
+	// look for a count we can share first. if there is no way to name it for
+	// sharing, use a label tied to this query.
 	if (rel->reloptkind == RELOPT_BASEREL)
-	{
-		char *scan = CardFeedbackScanIdentity(root, rel);
-
-		if (scan != NULL)
-			return scan;
-	}
+		identity = CardFeedbackScanIdentity(root, rel);
+	else
+		identity = CardFeedbackPairIdentity(root, rel, restrictlist);
+	if (identity != NULL)
+		return identity;
 	initStringInfo(&key);
 	appendStringInfo(&key, "%ssubset:", context);
 	while ((member = bms_next_member(rel->relids, member)) >= 0)

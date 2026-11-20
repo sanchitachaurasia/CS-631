@@ -12,7 +12,7 @@ extern uint64 card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel);
 
 extern PGDLLIMPORT bool enable_card_feedback_apply;
 extern int card_feedback_cached_plan_depth;
-extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel);
+extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist);
 extern bool CardFeedbackLookup(uint64 signature, const char *identity, double *rows);
 
 typedef struct CardFeedbackKey
