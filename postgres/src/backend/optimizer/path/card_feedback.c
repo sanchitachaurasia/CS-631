@@ -69,6 +69,31 @@ safe_function(Oid function)
 		func_volatile(function) == PROVOLATILE_IMMUTABLE;
 }
 
+/*
+ * Catalog immutability alone is not a session-independence guarantee.
+ * For example, float8out() is marked immutable but uses extra_float_digits.
+ * Only allow scalar functions whose behavior is covered by the key.
+ */
+static bool
+safe_scalar_function(Oid function)
+{
+	switch (function)
+	{
+		case F_ABS_INT2:
+		case F_ABS_INT4:
+		case F_ABS_INT8:
+		case F_INT2_INT4:
+		case F_INT2_INT8:
+		case F_INT4_INT2:
+		case F_INT4_INT8:
+		case F_INT8_INT2:
+		case F_INT8_INT4:
+			return safe_function(function);
+		default:
+			return false;
+	}
+}
+
 // use ordinary values like an integer or some text. a whole row can contain
 // many different fields.
 static bool
@@ -131,7 +156,7 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 			OpExpr *op = (OpExpr *) node;
 
 			op->opfuncid = get_opcode(op->opno);
-			if (!safe_function(op->opfuncid))
+			if (op->opno >= FirstGenbkiObjectId || !safe_function(op->opfuncid))
 				return true;
 			op->location = -1;
 			break;
@@ -143,7 +168,7 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 			ScalarArrayOpExpr *op = (ScalarArrayOpExpr *) node;
 
 			op->opfuncid = get_opcode(op->opno);
-			if (!safe_function(op->opfuncid))
+			if (op->opno >= FirstGenbkiObjectId || !safe_function(op->opfuncid))
 				return true;
 			op->location = -1;
 			break;
@@ -154,7 +179,7 @@ CardFeedbackNormalizeExpr(Node *node, void *context)
 
 			// a function that returns many rows can change the count. this
 			// check only accepts a function that gives one value.
-			if (func->funcretset || !safe_function(func->funcid))
+			if (func->funcretset || !safe_scalar_function(func->funcid))
 				return true;
 			func->location = -1;
 			break;

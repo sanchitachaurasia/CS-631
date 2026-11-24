@@ -218,10 +218,10 @@ index 1e199ff66f..0931a42e75 100644
  	equivclass.o \
 diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
 new file mode 100644
-index 0000000000..946224bbb0
+index 0000000000..8c816370f7
 --- /dev/null
 +++ b/src/backend/optimizer/path/card_feedback.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,837 @@
 +/* save complete row counts and use them when postgresql picks a plan. */
 +#include "postgres.h"
 +
@@ -293,6 +293,31 @@ index 0000000000..946224bbb0
 +		func_volatile(function) == PROVOLATILE_IMMUTABLE;
 +}
 +
++/*
++ * Catalog immutability alone is not a session-independence guarantee.
++ * For example, float8out() is marked immutable but uses extra_float_digits.
++ * Only allow scalar functions whose behavior is covered by the key.
++ */
++static bool
++safe_scalar_function(Oid function)
++{
++	switch (function)
++	{
++		case F_ABS_INT2:
++		case F_ABS_INT4:
++		case F_ABS_INT8:
++		case F_INT2_INT4:
++		case F_INT2_INT8:
++		case F_INT4_INT2:
++		case F_INT4_INT8:
++		case F_INT8_INT2:
++		case F_INT8_INT4:
++			return safe_function(function);
++		default:
++			return false;
++	}
++}
++
 +// use ordinary values like an integer or some text. a whole row can contain
 +// many different fields.
 +static bool
@@ -355,7 +380,7 @@ index 0000000000..946224bbb0
 +			OpExpr *op = (OpExpr *) node;
 +
 +			op->opfuncid = get_opcode(op->opno);
-+			if (!safe_function(op->opfuncid))
++			if (op->opno >= FirstGenbkiObjectId || !safe_function(op->opfuncid))
 +				return true;
 +			op->location = -1;
 +			break;
@@ -367,7 +392,7 @@ index 0000000000..946224bbb0
 +			ScalarArrayOpExpr *op = (ScalarArrayOpExpr *) node;
 +
 +			op->opfuncid = get_opcode(op->opno);
-+			if (!safe_function(op->opfuncid))
++			if (op->opno >= FirstGenbkiObjectId || !safe_function(op->opfuncid))
 +				return true;
 +			op->location = -1;
 +			break;
@@ -378,7 +403,7 @@ index 0000000000..946224bbb0
 +
 +			// a function that returns many rows can change the count. this
 +			// check only accepts a function that gives one value.
-+			if (func->funcretset || !safe_function(func->funcid))
++			if (func->funcretset || !safe_scalar_function(func->funcid))
 +				return true;
 +			func->location = -1;
 +			break;

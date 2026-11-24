@@ -1,0 +1,46 @@
+PASS: the two switches worked independently, and plain EXPLAIN recorded nothing.
+PASS: independent read-only connections learned 10 → 1,000 with equal results.
+PASS: a snapshot with an in-flight writer learned only within its transaction.
+PASS: a different role could not use the original role's observation.
+PASS: committed UPDATE and ANALYZE caused misses and allowed fresh learning.
+PASS: TRUNCATE discarded the old count and learned an empty result.
+PASS: two- and three-table joins learned exact counts. The two-table join switched algorithms.
+PASS: a new join reused both standalone scans and missed on a different table or filter.
+PASS: a larger join reused a two-table count and missed when its effective conditions changed.
+PASS: partial plans, cursors and prepared plans supplied no reusable row counts.
+PASS: inner-unique nested-loop early stop and an empty hash build excluded partial children.
+PASS: a completed join was learned above Memoize without learning the cached input.
+PASS: four concurrent connections stored all 20 observations.
+PASS: the 1,024-entry store evicted the least recently updated observation.
+PASS: autocommit, read committed, read-write, and serializable did not apply feedback.
+PASS: enabling parallel workers blocked reuse for a serial plan.
+PASS: sequential, index, index-only, and bitmap scans shared complete counts.
+PASS: aggregation recorded the scan count separately from the number of groups.
+PASS: arrays, null tests, Boolean filters, integer abs, and integer casts reused counts.
+PASS: changing a column, operator, or Boolean condition caused a miss.
+PASS: unsupported query forms kept their results without applying feedback.
+PASS: temporary, unlogged, sampled, partitioned, and inherited scans supplied no reusable hits.
+PASS: stable and user-defined filter functions did not supply reusable counts.
+PASS: an oversized identity fell back, and an ordinary predicate still learned.
+PASS: same-named tables in different schemas kept separate observations.
+PASS: row security returned each policy's rows without reusing feedback.
+PASS: a role reset only its own observations.
+PASS: inspection and reset stayed within the current database.
+PASS: committed INSERT and DELETE invalidated prior counts and allowed relearning.
+PASS: an open repeatable-read transaction kept its old count across a concurrent commit.
+PASS: a replacement table with the same name learned a new count.
+PASS: generic and custom prepared plans skipped reuse with bound parameters.
+PASS: a cursor exhausted in multiple calls supplied no reusable count.
+PASS: a merge join recorded its output without using its children's counts.
+PASS: a multi-batch hash join learned its output and build input only.
+PASS: a non-equality join reused its count in the original query context.
+PASS: a self-join kept its count in the original query context.
+PASS: multiple equality clauses matched after reordering and missed after a change.
+PASS: four clients recorded distinct keys without dropping observations.
+PASS: concurrent readers saw complete snapshots before or after a reset.
+PASS: an inner scan executed once with a join key did not teach the unconditional scan.
+PASS: a four-table query reused the matching two-table count.
+PASS: a pair count learned with an active writer stayed within its transaction.
+PASS: an imported snapshot rejected a count after the physical table was rewritten.
+PASS: the diagnostic average updated across observations without supplying reusable feedback.
+PASS: server restart cleared feedback.
