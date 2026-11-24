@@ -1,0 +1,9 @@
+/.local/
+/P019.pdf
+/output/pdf/
+.DS_Store
+__pycache__/
+/project/extension/*.o
+/project/extension/*.so
+/project/extension/*.dylib
+/project/extension/*.bc

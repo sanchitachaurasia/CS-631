@@ -1,5 +1,6 @@
 \echo Use "CREATE EXTENSION card_feedback" to load this file. \quit
 
+-- Show the recent estimate and observed counts for the current database and role.
 CREATE FUNCTION card_feedback_entries(
     OUT signature text,
     OUT raw_est_rows double precision,
@@ -11,6 +12,7 @@ CREATE FUNCTION card_feedback_entries(
 AS 'MODULE_PATHNAME', 'cf_entries'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
+-- Clear this database and role's entries and return how many were removed.
 CREATE FUNCTION card_feedback_reset() RETURNS integer
 AS 'MODULE_PATHNAME', 'cf_reset'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;

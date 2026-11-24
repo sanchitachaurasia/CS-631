@@ -1,0 +1,2 @@
+# Unified diffs preserve whitespace in source and context lines.
+project/postgres.patch -whitespace
