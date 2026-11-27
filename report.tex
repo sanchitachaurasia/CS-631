@@ -1,0 +1,275 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=22.1mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs,tabularx}
+\usepackage[hidelinks]{hyperref}
+
+\hypersetup{
+  pdftitle={Cardinality Feedback in PostgreSQL},
+  pdfauthor={Prabhav Khandelwal, Sanchita Chaurasia, Saksham Saharia}
+}
+\urlstyle{same}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+\begin{document}
+
+\begin{center}
+{\Large\bfseries Cardinality Feedback in PostgreSQL}\\[6pt]
+Prabhav Khandelwal (23B0988)\\
+Sanchita Chaurasia (23B1048)\\
+Saksham Saharia (23B1078)\\[4pt]
+CS631 Database Systems Project
+\end{center}
+
+\textbf{Project repository}\quad
+\url{https://github.com/sanchitachaurasia/CS-631}
+
+\section*{What we built}
+Before PostgreSQL runs a query, it estimates how many rows each scan and join
+will return. The planner uses those estimates to compare possible plans. For
+example, a nested loop might be cheap when a join has only a few rows to
+process. The same plan can do a lot of extra work if that estimate is too low.
+Estimates can be especially difficult when filters on different columns or
+tables are related.
+
+We added a feedback loop to PostgreSQL 16.13. The executor measures how many
+rows a completed scan or inner join produced. A later query can use that
+measurement if it needs the same rows from the same view of the data. The
+saved value is a row count. The later query still reads its data and executes
+its chosen plan. The idea of learning from execution measurements comes from
+LEO~\cite{leo}.
+
+The initial prototype collected counts and reused them in a restricted
+read-only transaction. We extended it so the count from a standalone table
+scan can help plan a join. We also made it possible to reuse the count from a
+two-table join when that pair appears inside a larger join. When the database
+snapshot allows it, these observations can be shared across connections.
+
+\section*{How it fits into PostgreSQL}
+\textbf{At planning time.} In \texttt{costsize.c}, PostgreSQL computes its
+usual row estimate for a table scan or an inner join. The new
+\texttt{CardFeedbackEstimate} hook looks up a matching count when application
+is enabled. On a hit it replaces the relation's estimate before paths are
+costed. A count of zero becomes an estimate of one, following PostgreSQL's
+minimum. PostgreSQL then uses its ordinary cost model and plan search.
+
+\textbf{From the plan to the executor.} For an eligible scan or join,
+\texttt{createplan.c} carries the lookup key and the estimate from before
+replacement into the plan. Paths that take parameters from an outer relation
+are skipped. Such a path might read different rows each time it is called, so a
+count from one invocation would describe only that input.
+
+\textbf{After execution.} With collection enabled, the executor records
+complete observations in a shared store for later planning.
+
+Both feedback settings default to off.
+
+\begin{tabular}{@{}ll@{}}
+\texttt{enable\_card\_feedback\_collect} & Records complete counts. \\
+\texttt{enable\_card\_feedback\_apply} & Uses saved counts during planning. \\
+\end{tabular}
+
+The modified source is in \texttt{postgres/}. The first commit is the stock
+baseline.\\
+The patch in \texttt{project/postgres.patch} shows the same changes against
+that baseline.
+
+\newpage
+
+\section*{Collecting and storing counts}
+In \texttt{execMain.c}, the collection setting enables PostgreSQL's existing
+row counters for a running \texttt{SELECT}. A plain \texttt{EXPLAIN} displays
+a plan without running it, so it supplies no observations. The executor records
+whether it ran forward to the end in one unrestricted call. It skips collection
+after bounded reads, rewinds, or repeated executor calls.
+
+At shutdown, \texttt{CardFeedbackCollect} checks the plan while its counters
+are still available. The collector starts at the completed plan output and
+follows only inputs that were fully read. Even then, a node must have run once,
+because a counter accumulated over several loops can combine different
+inputs. Some nodes require extra care.
+
+\begin{itemize}
+\item A nested loop reads its outer input, but it may stop an inner scan after
+  the first match. That inner count can be smaller than the full scan count.
+\item A serial hash build reads its whole build input. The collector follows
+  the probe input only when the hash table is nonempty and uses one batch.
+\item A merge join can stop reading either side early, and \texttt{Memoize}
+  can return saved output from earlier calls. The collector does not follow
+  those inputs.
+\end{itemize}
+
+\texttt{card\_feedback.c} keeps up to 1,024 entries in shared memory. Each
+key has a 16 KiB identity buffer and a ring containing its 16 latest complete
+observations. Readers can share the lock; updates and least-recently-updated
+eviction use the exclusive lock. Each sample keeps the original estimate,
+actual count, timestamp and sequence number.
+
+The C code summarizes the ring with median and 90th-percentile Q-error,
+log-scale variability, outlier count, drift between older and newer samples,
+and a row-count trend. Confidence rises as evidence accumulates and falls
+with instability, outliers, drift and age; its age component halves every
+seven days. During planning, PostgreSQL blends its normal estimate with the
+latest measured count according to this confidence.
+
+The extension exposes these summaries through
+\texttt{card\_feedback\_entries()} and the chronological samples through
+\texttt{card\_feedback\_history()}. History is copied while holding the shared
+lock and formatted after releasing it. \texttt{card\_feedback\_prune(seconds)}
+removes entries whose last observation is older than the requested age.
+
+\section*{Matching the same work}
+A key represents the rows that a scan or join should produce. It includes the
+effective restrictions from the planner, including filters that PostgreSQL
+infers from other conditions in the query.
+
+\begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}X@{}}
+\toprule
+\textbf{Key} & \textbf{What is matched} \\
+\midrule
+Scan & The table, its storage locator and its effective filters. A change to
+a column, operator or literal changes the key. An alias or a different
+ordering of the top-level \texttt{AND} terms can still match. \\
+\addlinespace
+Two-table join & The scan keys for two distinct tables and the effective
+column equalities between them. The key puts the tables and equality
+operands in a consistent order. \\
+\addlinespace
+Query-specific join & The normalized join tree, the tables it refers to and
+the subset of tables at this join. This covers other eligible joins within
+the same query context. \\
+\bottomrule
+\end{tabularx}
+
+\newpage
+
+\section*{When reuse is allowed}
+The query must run as a direct \texttt{SELECT} in an explicit read-only
+\texttt{REPEATABLE READ} transaction with no assigned transaction ID and with
+parallel query disabled. It must read permanent heap tables without
+inheritance or partitioning. Prepared statements, subqueries, row locking,
+row-level security, \texttt{LIMIT}, and \texttt{OFFSET} fall outside the reuse
+rules. When a check fails or the key is missing, PostgreSQL keeps its ordinary
+estimate.
+
+\subsection*{Supported filters and joins}
+\textbf{Table filters.}
+Examples include \texttt{=}, \texttt{<>}, \texttt{<}, \texttt{<=},
+\texttt{>}, and \texttt{>=} on ordinary columns with the built-in operators.
+The prototype also handles \texttt{BETWEEN}, \texttt{IN} lists,
+\texttt{= ANY} with an array, built-in \texttt{LIKE}, null and Boolean tests,
+and combinations with \texttt{AND}, \texttt{OR}, and \texttt{NOT}.
+The operator must use a built-in immutable function, which PostgreSQL marks
+as returning the same result for the same inputs. Direct function calls
+are limited to integer \texttt{abs} and casts between integer types.
+Sequential, index, index-only, and bitmap heap scans can supply counts.
+A scan count can carry over when the table appears in a join and its
+effective filters still match.
+
+\textbf{Inner joins.}
+The prototype can collect complete output counts from supported nested-loop,
+hash, and merge joins. A two-table count can transfer to a larger join
+when it matches the effective filters on both inputs and has one or more
+column equalities, such as \texttt{a.id = b.id}, that PostgreSQL recognizes
+for merge joining two distinct tables. An inequality join such as
+\texttt{a.id > b.id}, a self-join, or a \texttt{CROSS JOIN} can reuse its
+join count in the same query context. Joins that remain outer joins are
+outside the reuse rules.
+
+A database snapshot describes which transactions' changes the query can
+see. When a normal snapshot's lower and upper transaction ID bounds are
+equal, the code adds the cutoff and its epoch to the key. Two connections
+with the same cutoff can share a count under the supported conditions.
+If an older transaction keeps those bounds apart, reuse stays within the
+local transaction. A table rewrite changes the storage locator in the
+key. A write elsewhere can move the cutoff even if the tables in the query
+are unchanged.
+
+\section*{An example with IMDb data}
+We started with two standalone queries. One counted titles beginning with
+\texttt{Champion} or \texttt{Loser}. The other counted rows where
+\texttt{info\_type\_id = 101} and the stored rating text satisfied
+\texttt{info > '5.0'}. The scans gave the planner the following counts.
+
+\begin{tabularx}{\linewidth}{@{}Xrr@{}}
+\toprule
+\textbf{Filtered input} & \textbf{Original estimate} & \textbf{Saved count} \\
+\midrule
+\texttt{title} & 470 & 294 \\
+\texttt{movie\_info\_idx} & 169,381 & 352,990 \\
+\bottomrule
+\end{tabularx}
+
+We then joined the inputs on \texttt{title.id = movie\_info\_idx.movie\_id}.
+The planner used both scan counts to estimate the join. The join returned
+49 rows, which the store saved under a separate key for the pair.
+
+Finally, we planned a query that kept the same pair and added
+\texttt{kind\_type} to select movies. The planner reused 49 as the estimate
+for the pair and computed the final three-table estimate separately.
+Adding \texttt{kind\_type.id = 1} lets the planner infer
+\texttt{title.kind\_id = 1}. That adds a scan filter, so the old pair count
+no longer matches. The benchmark's \texttt{DEBUG1} messages show two scan
+hits and one pair hit for the matching query. The changed query reports no
+pair hit.
+
+\newpage
+
+\section*{Verification and results}
+We ran the same IMDb queries on stock PostgreSQL 16.13 and our patched server
+with feedback enabled. Both used the same data, indexes and server settings.
+The timed queries had a 15-second limit and three measurements per query.
+The separate screening queries had a four-second limit.
+
+\begin{tabularx}{\linewidth}{@{}Xrr@{}}
+\toprule
+\textbf{IMDb benchmark} & \textbf{Stock PostgreSQL} & \textbf{Our project} \\
+\midrule
+Timed queries completed out of 28 & 21 & 21 \\
+Screening queries completed out of 85 & 57 & 67 \\
+Median Q-error for the same 19 timed queries & 53 & 1 \\
+Geometric mean speedup for those 19 queries & \(1.00\times\) & \(1.76\times\) \\
+\bottomrule
+\end{tabularx}
+
+A Q-error of 1 is the best score. The 19 queries in the last two rows
+completed in both setups. Our project ran faster on 14 and slower on 5 of
+those queries. Binary results agreed whenever both setups returned a result
+that could be compared.
+
+\begin{tabularx}{\linewidth}{@{}Xr@{}}
+\toprule
+\textbf{Checks on the assertion-enabled build} & \textbf{Passed} \\
+\midrule
+PostgreSQL regression tests & 219 \\
+PostgreSQL isolation tests & 117 \\
+Project checks for reuse, partial execution and concurrency & 46 \\
+\bottomrule
+\end{tabularx}
+
+Run \texttt{bash project/run.sh build} and then
+\texttt{bash project/run.sh verify} to run the project checks. The benchmark
+instructions and saved results are under \texttt{results/job/}.
+
+\section*{Contributions}
+\textbf{Prabhav Khandelwal} worked on the proposal and checkpoint, including
+the first PostgreSQL build, row counting and the initial feedback store.
+
+\textbf{Sanchita Chaurasia} worked on join feedback, integration checks and
+reuse of scan and two-table join counts in later queries.
+
+\textbf{Saksham Saharia} worked on the IMDb setup, benchmark runs and
+comparison of query plans and results and also implemented support for
+cardinality-feedback history, confidence diagnostics and stale-entry pruning.
+
+\textbf{AI assistance.} AI implemented the snapshot checks and reuse keys
+and helped automate benchmarks and tests.
+
+\begin{thebibliography}{1}
+\bibitem{leo} M. Stillger, G. Lohman, V. Markl, and M. Kandil.
+\emph{LEO -- DB2's LEarning Optimizer}. VLDB, 2001.
+\end{thebibliography}
+
+\end{document}
