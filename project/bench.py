@@ -39,8 +39,11 @@ def command(args, **options):
 
 def digest_file(path):
     # Read the file in chunks so hashing the dataset does not load it into memory.
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Cluster:
