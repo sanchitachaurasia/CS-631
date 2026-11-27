@@ -7,7 +7,9 @@ CREATE FUNCTION card_feedback_entries(
     OUT last_actual_rows double precision,
     OUT ema_actual_rows double precision,
     OUT observations bigint,
-    OUT last_updated timestamptz
+    OUT last_updated timestamptz,
+    OUT feedback_confidence double precision,
+    OUT log_row_stddev double precision
 ) RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'cf_entries'
 LANGUAGE C VOLATILE PARALLEL UNSAFE;
