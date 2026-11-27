@@ -26,7 +26,11 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include <float.h>
 #include <math.h>
+
+// Treat five percent log-count movement per sample as a directional trend.
+#define CARD_FEEDBACK_TREND_LOG_THRESHOLD 0.05
 
 #ifdef CARD_FEEDBACK_PROFILE
 #include "portability/instr_time.h"
@@ -624,6 +628,232 @@ card_feedback_rel_signature(PlannerInfo *root, RelOptInfo *rel)
 /* counts stay in memory until removed, cleared, or the server restarts. */
 static HTAB *CardFeedbackHash = NULL;
 
+// Keep a bounded chronological sample for each reusable feedback identity.
+static void
+CardFeedbackRememberObservation(CardFeedbackEntry *entry, double raw_rows,
+								double actual_rows, TimestampTz observed_at)
+{
+	CardFeedbackObservation *observation;
+	int slot = entry->history_next;
+
+	observation = &entry->history[slot];
+	observation->observation_id = entry->observations;
+	observation->raw_est_rows = raw_rows;
+	observation->actual_rows = actual_rows;
+	observation->observed_at = observed_at;
+
+	entry->history_next = (slot + 1) % CARD_FEEDBACK_HISTORY_SIZE;
+	if (entry->history_count < CARD_FEEDBACK_HISTORY_SIZE)
+		entry->history_count++;
+}
+
+// Sort local metric vectors while leaving the observation ring in time order.
+static int
+CardFeedbackCompareDouble(const void *left, const void *right)
+{
+	double a = *((const double *) left);
+	double b = *((const double *) right);
+
+	if (a < b)
+		return -1;
+	if (a > b)
+		return 1;
+	return 0;
+}
+
+// Calculate a median after sorting a local copy of a metric vector.
+static double
+CardFeedbackMedian(double *values, int count)
+{
+	if (count <= 0)
+		return 0.0;
+	qsort(values, count, sizeof(double), CardFeedbackCompareDouble);
+	if (count % 2 != 0)
+		return values[count / 2];
+	return values[count / 2 - 1] * 0.5 + values[count / 2] * 0.5;
+}
+
+// Return a nearest-rank percentile from a small local copy of recent errors.
+static double
+CardFeedbackPercentile(double *values, int count, double percentile)
+{
+	int rank;
+
+	if (count <= 0)
+		return 0.0;
+	if (percentile < 0.0)
+		percentile = 0.0;
+	else if (percentile > 1.0)
+		percentile = 1.0;
+	qsort(values, count, sizeof(double), CardFeedbackCompareDouble);
+	rank = (int) ceil(percentile * count) - 1;
+	if (rank < 0)
+		rank = 0;
+	else if (rank >= count)
+		rank = count - 1;
+	return values[rank];
+}
+
+// Estimate direction from the ordered log-count sample, not a sorted copy.
+static double
+CardFeedbackLogSlope(const double *values, int count)
+{
+	double mean_x = (double) (count - 1) * 0.5;
+	double mean_y = 0.0;
+	double numerator = 0.0;
+	double denominator = 0.0;
+	int i;
+
+	if (count < 2)
+		return 0.0;
+	for (i = 0; i < count; i++)
+		mean_y += values[i] / count;
+	for (i = 0; i < count; i++)
+	{
+		double x_delta = i - mean_x;
+
+		numerator += x_delta * (values[i] - mean_y);
+		denominator += x_delta * x_delta;
+	}
+	return denominator > 0.0 ? numerator / denominator : 0.0;
+}
+
+// Refresh robust recent-error, variability, drift, and confidence metrics.
+static void
+CardFeedbackRefreshSummary(CardFeedbackEntry *entry)
+{
+	double actual_rows[CARD_FEEDBACK_HISTORY_SIZE];
+	double q_errors[CARD_FEEDBACK_HISTORY_SIZE];
+	double log_rows[CARD_FEEDBACK_HISTORY_SIZE];
+	double deviations[CARD_FEEDBACK_HISTORY_SIZE];
+	double older_logs[CARD_FEEDBACK_HISTORY_SIZE];
+	double recent_logs[CARD_FEEDBACK_HISTORY_SIZE];
+	double mean = 0.0;
+	double sum_squares = 0.0;
+	double median_log;
+	double variance;
+	double maturity;
+	double stability;
+	double outlier_penalty;
+	double drift_penalty = 1.0;
+	int outliers = 0;
+	int older_count = 0;
+	int recent_count = 0;
+	int count = entry->history_count;
+	int first;
+	int i;
+
+	if (count == 0)
+	{
+		entry->recent_median_rows = 0.0;
+		entry->recent_median_q_error = 0.0;
+		entry->recent_p90_q_error = 0.0;
+		entry->recent_log_stddev = 0.0;
+		entry->recent_log_mad = 0.0;
+		entry->recent_log_slope = 0.0;
+		entry->drift_ratio = 1.0;
+		entry->confidence = 0.0;
+		entry->recent_outlier_count = 0;
+		entry->trend_direction = 0;
+		return;
+	}
+
+	first = (entry->history_next + CARD_FEEDBACK_HISTORY_SIZE - count) %
+		CARD_FEEDBACK_HISTORY_SIZE;
+	for (i = 0; i < count; i++)
+	{
+		int slot = (first + i) % CARD_FEEDBACK_HISTORY_SIZE;
+		CardFeedbackObservation *observation = &entry->history[slot];
+		double actual = observation->actual_rows;
+		double raw = observation->raw_est_rows;
+		double lower = Min(raw, actual);
+		double upper = Max(raw, actual);
+		double log_actual = log(actual + 1.0);
+
+		actual_rows[i] = actual;
+		q_errors[i] = (upper + 1.0) / (lower + 1.0);
+		log_rows[i] = log_actual;
+
+		// Welford's update avoids subtracting two large second moments.
+		{
+			double delta = log_actual - mean;
+
+			mean += delta / (i + 1);
+			sum_squares += delta * (log_actual - mean);
+		}
+
+		if (i < count / 2)
+			older_logs[older_count++] = log_actual;
+		else
+			recent_logs[recent_count++] = log_actual;
+	}
+
+	entry->recent_median_rows = CardFeedbackMedian(actual_rows, count);
+	entry->recent_median_q_error = CardFeedbackMedian(q_errors, count);
+	entry->recent_p90_q_error = CardFeedbackPercentile(q_errors, count, 0.90);
+	for (i = 0; i < count; i++)
+		deviations[i] = log_rows[i];
+	median_log = CardFeedbackMedian(deviations, count);
+	for (i = 0; i < count; i++)
+		deviations[i] = fabs(log_rows[i] - median_log);
+	entry->recent_log_mad = CardFeedbackMedian(deviations, count);
+
+	// Flag isolated jumps without letting them move the center of the sample.
+	for (i = 0; i < count; i++)
+		if (fabs(log_rows[i] - median_log) > 3.0 * 1.4826 * entry->recent_log_mad)
+			outliers++;
+	entry->recent_outlier_count = outliers;
+	outlier_penalty = 1.0 / (1.0 + (double) outliers / count);
+	variance = sum_squares / count;
+	if (variance < 0.0)
+		variance = 0.0;
+	entry->recent_log_stddev = sqrt(variance);
+	entry->recent_log_slope = CardFeedbackLogSlope(log_rows, count);
+	if (entry->recent_log_slope > CARD_FEEDBACK_TREND_LOG_THRESHOLD)
+		entry->trend_direction = 1;
+	else if (entry->recent_log_slope < -CARD_FEEDBACK_TREND_LOG_THRESHOLD)
+		entry->trend_direction = -1;
+	else
+		entry->trend_direction = 0;
+	entry->drift_ratio = 1.0;
+
+	// Compare the older and newer halves to detect a changing count regime.
+	if (count >= 4 && older_count > 0 && recent_count > 0)
+	{
+		double older_median = CardFeedbackMedian(older_logs, older_count);
+		double recent_median = CardFeedbackMedian(recent_logs, recent_count);
+		double log_drift = recent_median - older_median;
+
+		if (log_drift > log(DBL_MAX))
+			entry->drift_ratio = DBL_MAX;
+		else if (log_drift < log(DBL_MIN))
+			entry->drift_ratio = 0.0;
+		else
+			entry->drift_ratio = exp(log_drift);
+		drift_penalty = 1.0 / (1.0 + fabs(log_drift));
+	}
+
+	// Repeated evidence raises trust; unstable or shifting counts lower it.
+	maturity = (double) entry->observations /
+		((double) entry->observations + 1.0);
+	stability = 1.0 / (1.0 + entry->recent_log_mad);
+	entry->confidence = maturity * stability * drift_penalty * outlier_penalty;
+}
+
+// Let stale feedback fade even when its retained observations were consistent.
+static double
+CardFeedbackFreshness(TimestampTz last_updated, TimestampTz now)
+{
+	const int64 half_life_usec = INT64CONST(604800000000);
+	int64 age_usec = now - last_updated;
+	double half_lives;
+
+	if (age_usec <= 0)
+		return 1.0;
+	half_lives = (double) age_usec / (double) half_life_usec;
+	return exp(-0.6931471805599453 * half_lives);
+}
+
 Size
 CardFeedbackShmemSize(void)
 {
@@ -716,8 +946,10 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 				strlcpy(entry->identity, identity, sizeof(entry->identity));
 			entry->observations = 0;
 			entry->ema_actual_rows = actual_rows;
-			entry->ema_log_rows = log(actual_rows + 1.0);
-			entry->ema_log_rows_sq = entry->ema_log_rows * entry->ema_log_rows;
+			entry->history_next = 0;
+			entry->history_count = 0;
+			entry->drift_ratio = 1.0;
+			entry->confidence = 0.0;
 		}
 	}
 	/* A hash collision must never merge a reusable identity with another entry. */
@@ -727,19 +959,12 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 		entry->raw_est_rows = raw_rows;
 		entry->last_actual_rows = actual_rows;
 		if (entry->observations > 0)
-		{
 			entry->ema_actual_rows = 0.5 * actual_rows + 0.5 * entry->ema_actual_rows;
-			// Track count volatility in log space so large counts do not dominate.
-			{
-				double log_rows = log(actual_rows + 1.0);
-
-				entry->ema_log_rows = 0.5 * log_rows + 0.5 * entry->ema_log_rows;
-				entry->ema_log_rows_sq = 0.5 * log_rows * log_rows +
-					0.5 * entry->ema_log_rows_sq;
-			}
-		}
 		entry->observations++;
 		entry->last_updated = GetCurrentTimestamp();
+		CardFeedbackRememberObservation(entry, raw_rows, actual_rows,
+										entry->last_updated);
+		CardFeedbackRefreshSummary(entry);
 	}
 	LWLockRelease(CardFeedbackLock);
 #ifdef CARD_FEEDBACK_PROFILE
@@ -760,6 +985,7 @@ CardFeedbackSnapshot(int *count)
 	CardFeedbackEntry *copy = palloc(sizeof(CardFeedbackEntry) * CARD_FEEDBACK_MAX_ENTRIES);
 	HASH_SEQ_STATUS scan;
 	CardFeedbackEntry *entry;
+	TimestampTz now = GetCurrentTimestamp();
 
 	*count = 0;
 	LWLockAcquire(CardFeedbackLock, LW_SHARED);
@@ -767,22 +993,62 @@ CardFeedbackSnapshot(int *count)
 	while ((entry = hash_seq_search(&scan)) != NULL)
 	{
 		if (entry->key.database_id == MyDatabaseId && entry->key.user_id == GetUserId())
-			copy[(*count)++] = *entry;
+		{
+			copy[*count] = *entry;
+			copy[*count].confidence *= CardFeedbackFreshness(entry->last_updated, now);
+			(*count)++;
+		}
 	}
 	LWLockRelease(CardFeedbackLock);
 	return copy;
 }
 
-int
-CardFeedbackReset(void)
+// Copy observations in chronological order before SQL formats them unlocked.
+CardFeedbackHistoryRow *
+CardFeedbackHistorySnapshot(int *count)
+{
+	int maximum = CARD_FEEDBACK_MAX_ENTRIES * CARD_FEEDBACK_HISTORY_SIZE;
+	CardFeedbackHistoryRow *copy = palloc(sizeof(CardFeedbackHistoryRow) * maximum);
+	HASH_SEQ_STATUS scan;
+	CardFeedbackEntry *entry;
+
+	*count = 0;
+	LWLockAcquire(CardFeedbackLock, LW_SHARED);
+	hash_seq_init(&scan, CardFeedbackHash);
+	while ((entry = hash_seq_search(&scan)) != NULL)
+	{
+		int first;
+		int i;
+
+		if (entry->key.database_id != MyDatabaseId || entry->key.user_id != GetUserId())
+			continue;
+		first = (entry->history_next + CARD_FEEDBACK_HISTORY_SIZE -
+				 entry->history_count) % CARD_FEEDBACK_HISTORY_SIZE;
+		for (i = 0; i < entry->history_count; i++)
+		{
+			int slot = (first + i) % CARD_FEEDBACK_HISTORY_SIZE;
+			CardFeedbackObservation *observation = &entry->history[slot];
+			CardFeedbackHistoryRow *row = &copy[(*count)++];
+
+			row->signature = entry->key.signature;
+			row->observation_id = observation->observation_id;
+			row->raw_est_rows = observation->raw_est_rows;
+			row->actual_rows = observation->actual_rows;
+			row->observed_at = observation->observed_at;
+		}
+	}
+	LWLockRelease(CardFeedbackLock);
+	return copy;
+}
+
+// Remove matching keys after the hash scan has completed under one lock.
+static int
+CardFeedbackRemoveEntries(bool remove_all, TimestampTz cutoff)
 {
 	CardFeedbackKey *keys;
 	int removed = 0;
 	int i;
 
-	/* One exclusive critical section makes reset atomic relative to writers. */
-	// to delete an entry, we only need its key. there is no need to copy the
-	// whole count and filter text.
 	keys = palloc(sizeof(CardFeedbackKey) * CARD_FEEDBACK_MAX_ENTRIES);
 	LWLockAcquire(CardFeedbackLock, LW_EXCLUSIVE);
 	{
@@ -791,8 +1057,14 @@ CardFeedbackReset(void)
 
 		hash_seq_init(&scan, CardFeedbackHash);
 		while ((entry = hash_seq_search(&scan)) != NULL)
-			if (entry->key.database_id == MyDatabaseId && entry->key.user_id == GetUserId())
+		{
+			bool in_scope = entry->key.database_id == MyDatabaseId &&
+				entry->key.user_id == GetUserId();
+			bool expired = entry->last_updated < cutoff;
+
+			if (in_scope && (remove_all || expired))
 				keys[removed++] = entry->key;
+		}
 	}
 	for (i = 0; i < removed; i++)
 		hash_search(CardFeedbackHash, &keys[i], HASH_REMOVE, NULL);
@@ -801,24 +1073,28 @@ CardFeedbackReset(void)
 	return removed;
 }
 
-static double
-CardFeedbackConfidence(const CardFeedbackEntry *entry)
+int
+CardFeedbackReset(void)
 {
-	double variance;
-	double maturity;
-	double stability;
+	// Reset ignores age and clears every entry in the current scope.
+	return CardFeedbackRemoveEntries(true, 0);
+}
 
-	if (entry->observations == 0)
-		return 0.0;
-	variance = entry->ema_log_rows_sq -
-		entry->ema_log_rows * entry->ema_log_rows;
-	if (variance < 0.0)
-		variance = 0.0;
-	// Four consistent observations reach 80% maturity.
-	maturity = (double) entry->observations /
-		((double) entry->observations + 1.0);
-	stability = 1.0 / (1.0 + sqrt(variance));
-	return maturity * stability;
+int
+CardFeedbackPrune(int64 max_age_usec)
+{
+	TimestampTz now;
+	TimestampTz cutoff;
+
+	if (max_age_usec < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("feedback age must not be negative")));
+
+	// The SQL wrapper bounds this duration to signed 32-bit seconds.
+	now = GetCurrentTimestamp();
+	cutoff = now - max_age_usec;
+	return CardFeedbackRemoveEntries(false, cutoff);
 }
 
 bool
@@ -828,6 +1104,7 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows,
 	CardFeedbackKey key;
 	CardFeedbackEntry *entry;
 	bool found = false;
+	TimestampTz now = GetCurrentTimestamp();
 #ifdef CARD_FEEDBACK_PROFILE
 	bool profile = message_level_is_interesting(DEBUG2);
 	instr_time start, acquired, finished;
@@ -856,7 +1133,8 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows,
 		strcmp(entry->identity, identity) == 0)
 	{
 		*rows = entry->last_actual_rows;
-		*confidence = CardFeedbackConfidence(entry);
+		*confidence = entry->confidence *
+			CardFeedbackFreshness(entry->last_updated, now);
 		found = true;
 	}
 	LWLockRelease(CardFeedbackLock);
