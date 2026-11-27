@@ -5004,6 +5004,7 @@ static void
 CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 {
 	double learned_rows;
+	double confidence;
 
 	// if collecting and reusing are both off, keep the usual estimate.
 	if (!enable_card_feedback_collect && !enable_card_feedback_apply)
@@ -5022,7 +5023,8 @@ CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 	rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
 										   strlen(rel->feedback_identity), 0);
 	if (enable_card_feedback_apply &&
-		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
+		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows,
+						   &confidence))
 	{
 		const char *scope = "query";
 
@@ -5030,9 +5032,11 @@ CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 			scope = "scan";
 		else if (strncmp(rel->feedback_identity, "pair:", 5) == 0)
 			scope = "pair";
-		rel->rows = clamp_row_est(learned_rows);
-		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
-			 rel->feedback_sig, rel->raw_est_rows, learned_rows, scope, rel->relid);
+		// Blend uncertain feedback with the planner's estimate.
+		rel->rows = clamp_row_est((1.0 - confidence) * rel->raw_est_rows +
+								  confidence * learned_rows);
+		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f confidence=%.3f scope=%s rti=%u",
+			 rel->feedback_sig, rel->raw_est_rows, learned_rows, confidence, scope, rel->relid);
 	}
 }
 

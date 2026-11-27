@@ -5,6 +5,7 @@
 #include "optimizer/card_feedback.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
+#include <math.h>
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(cf_entries);
@@ -26,9 +27,11 @@ cf_entries(PG_FUNCTION_ARGS)
 	// make one row for each saved count.
 	for (i = 0; i < count; i++)
 	{
-		Datum values[6];
-		bool nulls[6] = {false};
+		Datum values[8];
+		bool nulls[8] = {false};
 		char signature[32];
+		double variance;
+		double confidence;
 
 		// show the short id as text, it might be too big for a signed number
 		// in sql.
@@ -41,7 +44,19 @@ cf_entries(PG_FUNCTION_ARGS)
 		values[3] = Float8GetDatum(entries[i].ema_actual_rows);
 		values[4] = Int64GetDatum((int64) entries[i].observations);
 		values[5] = TimestampTzGetDatum(entries[i].last_updated);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		variance = entries[i].ema_log_rows_sq -
+			entries[i].ema_log_rows * entries[i].ema_log_rows;
+		if (variance < 0.0)
+			variance = 0.0;
+		confidence = (double) entries[i].observations /
+			((double) entries[i].observations + 1.0);
+		confidence *= 1.0 / (1.0 + sqrt(variance));
+		values[6] = Float8GetDatum(confidence);
+		values[7] = Float8GetDatum(sqrt(variance));
+		tuplestore_putvalues(rsinfo->setResult,
+							 rsinfo->setDesc,
+							 values,
+							 nulls);
 	}
 	pfree(entries);
 	return (Datum) 0;

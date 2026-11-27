@@ -1,5 +1,5 @@
 diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
-index 1f947505af..ece34694d7 100644
+index 1f94750..ece3469 100644
 --- a/doc/src/sgml/monitoring.sgml
 +++ b/doc/src/sgml/monitoring.sgml
 @@ -1962,6 +1962,10 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
@@ -14,7 +14,7 @@ index 1f947505af..ece34694d7 100644
        <entry><literal>AutoFile</literal></entry>
        <entry>Waiting to update the <filename>postgresql.auto.conf</filename>
 diff --git a/src/backend/executor/execMain.c b/src/backend/executor/execMain.c
-index 6a60fb3337..a881d8a8b2 100644
+index 6a60fb3..a881d8a 100644
 --- a/src/backend/executor/execMain.c
 +++ b/src/backend/executor/execMain.c
 @@ -36,6 +36,10 @@
@@ -205,7 +205,7 @@ index 6a60fb3337..a881d8a8b2 100644
  		/*
  		 * If we have a junk filter, then project a new tuple with the junk
 diff --git a/src/backend/optimizer/path/Makefile b/src/backend/optimizer/path/Makefile
-index 1e199ff66f..0931a42e75 100644
+index 1e199ff..0931a42 100644
 --- a/src/backend/optimizer/path/Makefile
 +++ b/src/backend/optimizer/path/Makefile
 @@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
@@ -218,10 +218,10 @@ index 1e199ff66f..0931a42e75 100644
  	equivclass.o \
 diff --git a/src/backend/optimizer/path/card_feedback.c b/src/backend/optimizer/path/card_feedback.c
 new file mode 100644
-index 0000000000..8c816370f7
+index 0000000..652b7ea
 --- /dev/null
 +++ b/src/backend/optimizer/path/card_feedback.c
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,872 @@
 +/* save complete row counts and use them when postgresql picks a plan. */
 +#include "postgres.h"
 +
@@ -250,6 +250,7 @@ index 0000000000..8c816370f7
 +#include "utils/rel.h"
 +#include "utils/snapmgr.h"
 +#include "utils/timestamp.h"
++#include <math.h>
 +
 +#ifdef CARD_FEEDBACK_PROFILE
 +#include "portability/instr_time.h"
@@ -939,6 +940,8 @@ index 0000000000..8c816370f7
 +				strlcpy(entry->identity, identity, sizeof(entry->identity));
 +			entry->observations = 0;
 +			entry->ema_actual_rows = actual_rows;
++			entry->ema_log_rows = log(actual_rows + 1.0);
++			entry->ema_log_rows_sq = entry->ema_log_rows * entry->ema_log_rows;
 +		}
 +	}
 +	/* A hash collision must never merge a reusable identity with another entry. */
@@ -948,7 +951,17 @@ index 0000000000..8c816370f7
 +		entry->raw_est_rows = raw_rows;
 +		entry->last_actual_rows = actual_rows;
 +		if (entry->observations > 0)
++		{
 +			entry->ema_actual_rows = 0.5 * actual_rows + 0.5 * entry->ema_actual_rows;
++			// Track count volatility in log space so large counts do not dominate.
++			{
++				double log_rows = log(actual_rows + 1.0);
++
++				entry->ema_log_rows = 0.5 * log_rows + 0.5 * entry->ema_log_rows;
++				entry->ema_log_rows_sq = 0.5 * log_rows * log_rows +
++					0.5 * entry->ema_log_rows_sq;
++			}
++		}
 +		entry->observations++;
 +		entry->last_updated = GetCurrentTimestamp();
 +	}
@@ -1012,8 +1025,29 @@ index 0000000000..8c816370f7
 +	return removed;
 +}
 +
++static double
++CardFeedbackConfidence(const CardFeedbackEntry *entry)
++{
++	double variance;
++	double maturity;
++	double stability;
++
++	if (entry->observations == 0)
++		return 0.0;
++	variance = entry->ema_log_rows_sq -
++		entry->ema_log_rows * entry->ema_log_rows;
++	if (variance < 0.0)
++		variance = 0.0;
++	// Four consistent observations reach 80% maturity.
++	maturity = (double) entry->observations /
++		((double) entry->observations + 1.0);
++	stability = 1.0 / (1.0 + sqrt(variance));
++	return maturity * stability;
++}
++
 +bool
-+CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
++CardFeedbackLookup(uint64 signature, const char *identity, double *rows,
++				   double *confidence)
 +{
 +	CardFeedbackKey key;
 +	CardFeedbackEntry *entry;
@@ -1046,6 +1080,7 @@ index 0000000000..8c816370f7
 +		strcmp(entry->identity, identity) == 0)
 +	{
 +		*rows = entry->last_actual_rows;
++		*confidence = CardFeedbackConfidence(entry);
 +		found = true;
 +	}
 +	LWLockRelease(CardFeedbackLock);
@@ -1060,7 +1095,7 @@ index 0000000000..8c816370f7
 +	return found;
 +}
 diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
-index 38b287437d..31dd1bae6e 100644
+index 38b2874..f55a4d6 100644
 --- a/src/backend/optimizer/path/costsize.c
 +++ b/src/backend/optimizer/path/costsize.c
 @@ -70,6 +70,8 @@
@@ -1072,7 +1107,7 @@ index 38b287437d..31dd1bae6e 100644
  
  #include <limits.h>
  #include <math.h>
-@@ -4997,6 +4999,43 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
+@@ -4997,6 +4999,47 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
  }
  
  
@@ -1081,6 +1116,7 @@ index 38b287437d..31dd1bae6e 100644
 +CardFeedbackEstimate(PlannerInfo *root, RelOptInfo *rel, List *restrictlist)
 +{
 +	double learned_rows;
++	double confidence;
 +
 +	// if collecting and reusing are both off, keep the usual estimate.
 +	if (!enable_card_feedback_collect && !enable_card_feedback_apply)
@@ -1099,7 +1135,8 @@ index 38b287437d..31dd1bae6e 100644
 +	rel->feedback_sig = hash_bytes_extended((unsigned char *) rel->feedback_identity,
 +										   strlen(rel->feedback_identity), 0);
 +	if (enable_card_feedback_apply &&
-+		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows))
++		CardFeedbackLookup(rel->feedback_sig, rel->feedback_identity, &learned_rows,
++						   &confidence))
 +	{
 +		const char *scope = "query";
 +
@@ -1107,16 +1144,18 @@ index 38b287437d..31dd1bae6e 100644
 +			scope = "scan";
 +		else if (strncmp(rel->feedback_identity, "pair:", 5) == 0)
 +			scope = "pair";
-+		rel->rows = clamp_row_est(learned_rows);
-+		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f scope=%s rti=%u",
-+			 rel->feedback_sig, rel->raw_est_rows, learned_rows, scope, rel->relid);
++		// Blend uncertain feedback with the planner's estimate.
++		rel->rows = clamp_row_est((1.0 - confidence) * rel->raw_est_rows +
++								  confidence * learned_rows);
++		elog(DEBUG1, "card_feedback applied signature=" UINT64_FORMAT " raw=%.0f learned=%.0f confidence=%.3f scope=%s rti=%u",
++			 rel->feedback_sig, rel->raw_est_rows, learned_rows, confidence, scope, rel->relid);
 +	}
 +}
 +
  /*
   * set_baserel_size_estimates
   *		Set the size estimates for the given base relation.
-@@ -5026,6 +5065,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+@@ -5026,6 +5069,8 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
  							   NULL);
  
  	rel->rows = clamp_row_est(nrows);
@@ -1125,7 +1164,7 @@ index 38b287437d..31dd1bae6e 100644
  
  	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
  
-@@ -5104,6 +5145,10 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+@@ -5104,6 +5149,10 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  										   inner_rel->rows,
  										   sjinfo,
  										   restrictlist);
@@ -1137,7 +1176,7 @@ index 38b287437d..31dd1bae6e 100644
  
  /*
 diff --git a/src/backend/optimizer/path/meson.build b/src/backend/optimizer/path/meson.build
-index b8871fd2d2..5c48844e1a 100644
+index b8871fd..5c48844 100644
 --- a/src/backend/optimizer/path/meson.build
 +++ b/src/backend/optimizer/path/meson.build
 @@ -2,6 +2,7 @@
@@ -1149,7 +1188,7 @@ index b8871fd2d2..5c48844e1a 100644
    'costsize.c',
    'equivclass.c',
 diff --git a/src/backend/optimizer/plan/createplan.c b/src/backend/optimizer/plan/createplan.c
-index 942392218c..754bd823a3 100644
+index 9423922..754bd82 100644
 --- a/src/backend/optimizer/plan/createplan.c
 +++ b/src/backend/optimizer/plan/createplan.c
 @@ -5373,6 +5373,20 @@ copy_generic_path_info(Plan *dest, Path *src)
@@ -1174,7 +1213,7 @@ index 942392218c..754bd823a3 100644
  
  /*
 diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
-index 8f1ded7338..28a585269b 100644
+index 8f1ded7..28a5852 100644
 --- a/src/backend/storage/ipc/ipci.c
 +++ b/src/backend/storage/ipc/ipci.c
 @@ -27,6 +27,7 @@
@@ -1202,7 +1241,7 @@ index 8f1ded7338..28a585269b 100644
  	dsm_shmem_init();
  
 diff --git a/src/backend/storage/lmgr/lwlocknames.txt b/src/backend/storage/lmgr/lwlocknames.txt
-index 6c7cf6c295..41ed55f62c 100644
+index 6c7cf6c..41ed55f 100644
 --- a/src/backend/storage/lmgr/lwlocknames.txt
 +++ b/src/backend/storage/lmgr/lwlocknames.txt
 @@ -53,3 +53,4 @@ XactTruncationLock					44
@@ -1211,7 +1250,7 @@ index 6c7cf6c295..41ed55f62c 100644
  NotifyQueueTailLock					47
 +CardFeedbackLock                        48
 diff --git a/src/backend/utils/cache/plancache.c b/src/backend/utils/cache/plancache.c
-index eacf7e3340..fbf407bd66 100644
+index eacf7e3..fbf407b 100644
 --- a/src/backend/utils/cache/plancache.c
 +++ b/src/backend/utils/cache/plancache.c
 @@ -62,6 +62,7 @@
@@ -1243,7 +1282,7 @@ index eacf7e3340..fbf407bd66 100644
  	/* Release snapshot if we got one */
  	if (snapshot_set)
 diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
-index 093567535b..93c3de4bee 100644
+index 0935675..93c3de4 100644
 --- a/src/backend/utils/misc/guc_tables.c
 +++ b/src/backend/utils/misc/guc_tables.c
 @@ -19,6 +19,8 @@
@@ -1282,7 +1321,7 @@ index 093567535b..93c3de4bee 100644
  		{"enable_nestloop", PGC_USERSET, QUERY_TUNING_METHOD,
  			gettext_noop("Enables the planner's use of nested-loop join plans."),
 diff --git a/src/include/executor/executor.h b/src/include/executor/executor.h
-index baef7e031e..ba2d4f7383 100644
+index baef7e0..ba2d4f7 100644
 --- a/src/include/executor/executor.h
 +++ b/src/include/executor/executor.h
 @@ -14,6 +14,8 @@
@@ -1295,7 +1334,7 @@ index baef7e031e..ba2d4f7383 100644
  #include "fmgr.h"
  #include "nodes/lockoptions.h"
 diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
-index 74718fa256..b935592efb 100644
+index 74718fa..b935592 100644
 --- a/src/include/nodes/execnodes.h
 +++ b/src/include/nodes/execnodes.h
 @@ -669,6 +669,8 @@ typedef struct EState
@@ -1308,7 +1347,7 @@ index 74718fa256..b935592efb 100644
  
  	List	   *es_exprcontexts;	/* List of ExprContexts within EState */
 diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
-index 0162d59e07..c0480587b7 100644
+index 0162d59..c048058 100644
 --- a/src/include/nodes/pathnodes.h
 +++ b/src/include/nodes/pathnodes.h
 @@ -197,6 +197,10 @@ struct PlannerInfo
@@ -1333,7 +1372,7 @@ index 0162d59e07..c0480587b7 100644
  	/*
  	 * per-relation planner control flags
 diff --git a/src/include/nodes/plannodes.h b/src/include/nodes/plannodes.h
-index d64fe6a328..9b19ea9cb7 100644
+index d64fe6a..9b19ea9 100644
 --- a/src/include/nodes/plannodes.h
 +++ b/src/include/nodes/plannodes.h
 @@ -126,6 +126,9 @@ typedef struct Plan
@@ -1348,10 +1387,10 @@ index d64fe6a328..9b19ea9cb7 100644
  
 diff --git a/src/include/optimizer/card_feedback.h b/src/include/optimizer/card_feedback.h
 new file mode 100644
-index 0000000000..405635256b
+index 0000000..a93fd0e
 --- /dev/null
 +++ b/src/include/optimizer/card_feedback.h
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,46 @@
 +#ifndef CARD_FEEDBACK_H
 +#define CARD_FEEDBACK_H
 +
@@ -1367,7 +1406,8 @@ index 0000000000..405635256b
 +extern PGDLLIMPORT bool enable_card_feedback_apply;
 +extern int card_feedback_cached_plan_depth;
 +extern char *CardFeedbackReadonlyIdentity(PlannerInfo *root, RelOptInfo *rel, List *restrictlist);
-+extern bool CardFeedbackLookup(uint64 signature, const char *identity, double *rows);
++extern bool CardFeedbackLookup(uint64 signature, const char *identity, double *rows,
++							   double *confidence);
 +
 +typedef struct CardFeedbackKey
 +{
@@ -1382,6 +1422,8 @@ index 0000000000..405635256b
 +	double raw_est_rows;
 +	double last_actual_rows;
 +	double ema_actual_rows;
++	double ema_log_rows;
++	double ema_log_rows_sq;
 +	uint64 observations;
 +	TimestampTz last_updated;
 +	char identity[CARD_FEEDBACK_IDENTITY_BYTES];
@@ -1396,7 +1438,7 @@ index 0000000000..405635256b
 +
 +#endif
 diff --git a/src/test/regress/expected/guc.out b/src/test/regress/expected/guc.out
-index 127c953297..c350568fdd 100644
+index 127c953..c350568 100644
 --- a/src/test/regress/expected/guc.out
 +++ b/src/test/regress/expected/guc.out
 @@ -858,10 +858,11 @@ SELECT name FROM tab_settings_flags
@@ -1415,7 +1457,7 @@ index 127c953297..c350568fdd 100644
  -- Runtime-computed GUCs should be part of the preset category.
  SELECT name FROM tab_settings_flags
 diff --git a/src/test/regress/expected/sysviews.out b/src/test/regress/expected/sysviews.out
-index 001c6e7eb9..c5ecb79e9a 100644
+index 001c6e7..c5ecb79 100644
 --- a/src/test/regress/expected/sysviews.out
 +++ b/src/test/regress/expected/sysviews.out
 @@ -113,6 +113,8 @@ select name, setting from pg_settings where name like 'enable%';

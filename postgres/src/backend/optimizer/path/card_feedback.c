@@ -26,6 +26,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include <math.h>
 
 #ifdef CARD_FEEDBACK_PROFILE
 #include "portability/instr_time.h"
@@ -715,6 +716,8 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 				strlcpy(entry->identity, identity, sizeof(entry->identity));
 			entry->observations = 0;
 			entry->ema_actual_rows = actual_rows;
+			entry->ema_log_rows = log(actual_rows + 1.0);
+			entry->ema_log_rows_sq = entry->ema_log_rows * entry->ema_log_rows;
 		}
 	}
 	/* A hash collision must never merge a reusable identity with another entry. */
@@ -724,7 +727,17 @@ CardFeedbackRecord(uint64 signature, double raw_rows, double actual_rows,
 		entry->raw_est_rows = raw_rows;
 		entry->last_actual_rows = actual_rows;
 		if (entry->observations > 0)
+		{
 			entry->ema_actual_rows = 0.5 * actual_rows + 0.5 * entry->ema_actual_rows;
+			// Track count volatility in log space so large counts do not dominate.
+			{
+				double log_rows = log(actual_rows + 1.0);
+
+				entry->ema_log_rows = 0.5 * log_rows + 0.5 * entry->ema_log_rows;
+				entry->ema_log_rows_sq = 0.5 * log_rows * log_rows +
+					0.5 * entry->ema_log_rows_sq;
+			}
+		}
 		entry->observations++;
 		entry->last_updated = GetCurrentTimestamp();
 	}
@@ -788,8 +801,29 @@ CardFeedbackReset(void)
 	return removed;
 }
 
+static double
+CardFeedbackConfidence(const CardFeedbackEntry *entry)
+{
+	double variance;
+	double maturity;
+	double stability;
+
+	if (entry->observations == 0)
+		return 0.0;
+	variance = entry->ema_log_rows_sq -
+		entry->ema_log_rows * entry->ema_log_rows;
+	if (variance < 0.0)
+		variance = 0.0;
+	// Four consistent observations reach 80% maturity.
+	maturity = (double) entry->observations /
+		((double) entry->observations + 1.0);
+	stability = 1.0 / (1.0 + sqrt(variance));
+	return maturity * stability;
+}
+
 bool
-CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
+CardFeedbackLookup(uint64 signature, const char *identity, double *rows,
+				   double *confidence)
 {
 	CardFeedbackKey key;
 	CardFeedbackEntry *entry;
@@ -822,6 +856,7 @@ CardFeedbackLookup(uint64 signature, const char *identity, double *rows)
 		strcmp(entry->identity, identity) == 0)
 	{
 		*rows = entry->last_actual_rows;
+		*confidence = CardFeedbackConfidence(entry);
 		found = true;
 	}
 	LWLockRelease(CardFeedbackLock);
